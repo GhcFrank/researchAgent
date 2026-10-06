@@ -11,7 +11,9 @@ import pytest
 import research_agent as agent_module
 from llm_extractor import ExtractionBackend, ExtractionError, ExtractionResult, ExtractionValidationError
 from research_agent import AgentPermissionError, ResearchAgent, ResearchAgentError
-from research_tools import MockResearchTool
+from research_tools import MockResearchTool, ResearchToolError
+from run_source_store import RunSourceStore, RunSourceStoreError
+from run_workspace import ResearchRunWorkspace
 from schemas import (
     Claim,
     ClaimEvidenceStatus,
@@ -76,6 +78,21 @@ def task():
 @pytest.fixture
 def storage(tmp_path):
     return ResearchStorage(tmp_path / "data")
+
+
+@pytest.fixture
+def workspace(tmp_path):
+    return ResearchRunWorkspace.create("PL", "company", root_dir=tmp_path / "runs")
+
+
+@pytest.fixture
+def workspace_storage(workspace):
+    return ResearchStorage(workspace.objects_dir)
+
+
+@pytest.fixture
+def source_store(workspace):
+    return RunSourceStore(workspace)
 
 
 @pytest.fixture
@@ -551,6 +568,182 @@ def test_backend_no_material_reports_not_found_without_calling_backend(task, sto
     assert result.candidate_gaps
     assert not result.search_coverage.period_covered and not result.search_coverage.scope_covered
     assert_storage_empty(storage)
+
+
+def test_optional_source_store_preserves_legacy_execution(agent, task, storage, tool):
+    assert agent.source_store is None
+    assert ResearchAgent(tool, storage, PROMPT, source_store=None).source_store is None
+    result = agent.run(task)
+    assert result.evidence_created and result.variables_created
+    assert set(storage.data_dir.parent.iterdir()) == {storage.data_dir}
+
+
+@pytest.mark.parametrize("path", ["deterministic", "backend"])
+def test_actual_read_materials_saved_before_extraction_and_exclusions_respected(
+    task, workspace_storage, source_store, tmp_path, materials, backend_result, monkeypatch, path,
+):
+    records = deepcopy(materials)
+    records[0]["raw_content"] = "<html>Mock raw earnings release</html>"
+    tool = fixture_tool(tmp_path, records)
+    task.constraints.excluded_sources = ["mock-src-004"]
+    events = []
+    read, put = tool.read, source_store.put
+
+    def record_read(ref):
+        material = read(ref)
+        events.append(("read", ref))
+        return material
+
+    def record_put(material):
+        key = put(material)
+        events.append(("put", material["source_ref"]))
+        return key
+
+    monkeypatch.setattr(tool, "read", record_read)
+    monkeypatch.setattr(source_store, "put", record_put)
+    backend = None
+    if path == "backend":
+        backend = FakeExtractionBackend(backend_result)
+        extract = backend.extract
+
+        def record_extract(**kwargs):
+            ref = kwargs["material"]["source_ref"]
+            assert source_store.contains(ref)
+            events.append(("extract", ref))
+            return extract(**kwargs)
+
+        monkeypatch.setattr(backend, "extract", record_extract)
+    else:
+        extract_entities = agent_module._extract_entities
+
+        def record_extract(materials, task):
+            assert all(source_store.contains(material["source_ref"]) for material in materials)
+            events.append(("extract", None))
+            return extract_entities(materials, task)
+
+        monkeypatch.setattr(agent_module, "_extract_entities", record_extract)
+    result = ResearchAgent(
+        tool, workspace_storage, PROMPT, extraction_backend=backend, source_store=source_store,
+    ).run(task)
+
+    assert tool.read_refs == ["mock-src-001", "mock-src-002"]
+    assert events == [("read", "mock-src-001"), ("put", "mock-src-001"),
+                      ("read", "mock-src-002"), ("put", "mock-src-002")] + (
+        [("extract", "mock-src-001"), ("extract", "mock-src-002")] if backend else [("extract", None)]
+    )
+    assert result.evidence_created and result.variables_created
+    for material in records:
+        if material["source_ref"] in tool.read_refs:
+            saved = source_store.get(material["source_ref"])
+            assert saved["content"] == material["content"]
+            if "raw_content" in material:
+                assert saved["raw_content"] == material["raw_content"]
+        else:
+            assert not source_store.contains(material["source_ref"])
+
+
+def test_source_store_stays_empty_when_no_material_is_read(
+    task, workspace_storage, source_store, workspace, tool, materials, backend_result,
+):
+    task.constraints.excluded_sources = [material["source_ref"] for material in materials]
+    backend = FakeExtractionBackend(backend_result)
+    result = ResearchAgent(
+        tool, workspace_storage, PROMPT, extraction_backend=backend, source_store=source_store,
+    ).run(task)
+    assert result.not_found and not tool.read_refs and not backend.calls
+    assert list(workspace.sources_raw_dir.iterdir()) == []
+    assert list(workspace.sources_normalized_dir.iterdir()) == []
+    assert_storage_empty(workspace_storage)
+
+
+@pytest.mark.parametrize("path", ["backend-extraction", "deterministic-validation"])
+def test_extraction_failure_retains_read_snapshots_without_persisting_objects(
+    task, workspace_storage, source_store, tmp_path, materials, backend_result, monkeypatch, path,
+):
+    tool = fixture_tool(tmp_path, materials[:2])
+    backend = None
+    if path == "backend-extraction":
+        failure = ExtractionValidationError("simulated extraction failure")
+        backend = FakeExtractionBackend(backend_result, {materials[1]["source_ref"]: failure})
+        expected_error, message = ResearchAgentError, "Extraction backend failed"
+    else:
+        monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [forbidden_object(Claim)])
+        expected_error, message = AgentPermissionError, "Claim"
+    agent = ResearchAgent(
+        tool, workspace_storage, PROMPT, extraction_backend=backend, source_store=source_store,
+    )
+    with pytest.raises(expected_error, match=message) as error:
+        agent.run(task)
+    if backend is not None:
+        assert error.value.__cause__ is failure and len(backend.calls) == 2
+    assert tool.read_refs == [material["source_ref"] for material in materials[:2]]
+    for material in materials[:2]:
+        assert source_store.get(material["source_ref"])["content"] == material["content"]
+    assert_storage_empty(workspace_storage)
+
+
+@pytest.mark.parametrize("path", ["deterministic", "backend"])
+def test_source_store_failure_stops_before_extraction(
+    task, workspace_storage, source_store, workspace, tool, backend_result, monkeypatch, path,
+):
+    failure = RunSourceStoreError("simulated source-store failure")
+    puts = []
+
+    def fail_put(material):
+        puts.append(material["source_ref"])
+        raise failure
+
+    def unexpected_extraction(*args):
+        pytest.fail("Extraction must not run after source persistence failure")
+
+    monkeypatch.setattr(source_store, "put", fail_put)
+    monkeypatch.setattr(agent_module, "_extract_entities", unexpected_extraction)
+    backend = FakeExtractionBackend(backend_result) if path == "backend" else None
+    agent = ResearchAgent(
+        tool, workspace_storage, PROMPT, extraction_backend=backend, source_store=source_store,
+    )
+    with pytest.raises(ResearchAgentError, match="Source material persistence failed for mock-src-001") as error:
+        agent.run(task)
+    assert error.value.__cause__ is failure
+    assert tool.read_refs == puts == ["mock-src-001"]
+    if backend is not None:
+        assert backend.calls == []
+    assert list(workspace.sources_raw_dir.iterdir()) == []
+    assert list(workspace.sources_normalized_dir.iterdir()) == []
+    assert_storage_empty(workspace_storage)
+
+
+def test_read_failure_preserves_error_and_only_saves_successful_reads(
+    task, workspace_storage, source_store, tool, materials, backend_result, monkeypatch,
+):
+    failure = ResearchToolError("simulated read failure")
+    read, put = tool.read, source_store.put
+    puts = []
+
+    def fail_second_read(ref):
+        if ref == "mock-src-002":
+            tool.read_refs.append(ref)
+            raise failure
+        return read(ref)
+
+    def record_put(material):
+        puts.append(material["source_ref"])
+        return put(material)
+
+    monkeypatch.setattr(tool, "read", fail_second_read)
+    monkeypatch.setattr(source_store, "put", record_put)
+    backend = FakeExtractionBackend(backend_result)
+    agent = ResearchAgent(
+        tool, workspace_storage, PROMPT, extraction_backend=backend, source_store=source_store,
+    )
+    with pytest.raises(ResearchToolError, match="simulated read failure") as error:
+        agent.run(task)
+    assert error.value is failure
+    assert tool.read_refs == ["mock-src-001", "mock-src-002"] and puts == ["mock-src-001"]
+    assert source_store.get("mock-src-001")["content"] == materials[0]["content"]
+    assert not source_store.contains("mock-src-002") and not source_store.contains("mock-src-004")
+    assert not backend.calls
+    assert_storage_empty(workspace_storage)
 
 
 def test_cli_runs_example_with_temporary_data_directory(tmp_path):

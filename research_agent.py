@@ -20,6 +20,7 @@ from llm_extractor import (
     build_locatable_content,
 )
 from research_tools import MockResearchTool, ResearchMaterial, ResearchTool, ResearchToolError
+from run_source_store import RunSourceStore, RunSourceStoreError
 from schemas import (
     CandidateGap,
     Entity,
@@ -377,10 +378,12 @@ class ResearchAgent:
         prompt_path: Path | str = _PROJECT_DIR / "prompts" / "research_agent.md",
         *,
         extraction_backend: ExtractionBackend | None = None,
+        source_store: RunSourceStore | None = None,
     ):
         self.tool = tool
         self.storage = storage
         self.extraction_backend = extraction_backend
+        self.source_store = source_store
         try:
             self.prompt = Path(prompt_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -593,7 +596,15 @@ class ResearchAgent:
             (index for index, preferred in enumerate(preferences) if preferred in item["source_type"].casefold()),
             len(preferences),
         ))
-        materials = [self.tool.read(ref) for ref in dict.fromkeys(item["source_ref"] for item in summaries)]
+        materials = []
+        for ref in dict.fromkeys(item["source_ref"] for item in summaries):
+            material = self.tool.read(ref)
+            if self.source_store is not None:
+                try:
+                    self.source_store.put(material)
+                except RunSourceStoreError as exc:
+                    raise ResearchAgentError(f"Source material persistence failed for {ref}: {exc}") from exc
+            materials.append(material)
 
         if self.extraction_backend is not None:
             return self._run_backend(task, materials, attempts, timestamp)
