@@ -5,7 +5,60 @@ import json
 
 import pytest
 
-from research_tools import FixtureLoadError, MockResearchTool, SourceNotFoundError
+from research_tools import (
+    FixtureLoadError,
+    MockResearchTool,
+    ResearchTool,
+    ResearchToolSpec,
+    SourceNotFoundError,
+    UnsupportedToolCapabilityError,
+)
+
+
+def test_valid_tool_spec():
+    spec = ResearchToolSpec(
+        name="lookup", description="Use for local source lookup.", capabilities=("search",),
+    )
+    assert spec.name == "lookup"
+    assert spec.description == "Use for local source lookup."
+    assert spec.capabilities == ("search",)
+    assert spec.source_types == ()
+
+
+@pytest.mark.parametrize("invalid", [
+    {"name": " \t"},
+    {"description": ""},
+    {"capabilities": ("search", "write")},
+    {"capabilities": ()},
+])
+def test_invalid_tool_spec_rejected(invalid):
+    fields = {"name": "lookup", "description": "Use for source lookup.", "capabilities": ("search", "read")}
+    with pytest.raises(ValueError, match="ResearchToolSpec"):
+        ResearchToolSpec(**{**fields, **invalid})
+
+
+@pytest.mark.parametrize(("supported", "unsupported"), [("search", "read"), ("read", "search")])
+def test_capability_checked_before_retrieval(supported, unsupported):
+    calls = []
+    summary = {"source_ref": "local-one", "title": "Local source", "source_type": "mock", "locator": "mock://one"}
+
+    class LimitedTool(ResearchTool):
+        spec = ResearchToolSpec("limited", "Use for local retrieval.", (supported,))
+
+        def _search(self, query):
+            calls.append("search")
+            return [dict(summary)]
+
+        def _read(self, source_ref):
+            calls.append("read")
+            return {**summary, "content": "Local source content."}
+
+    tool = LimitedTool()
+    result = getattr(tool, supported)("local-one")
+    assert result == ([summary] if supported == "search" else {**summary, "content": "Local source content."})
+    with pytest.raises(UnsupportedToolCapabilityError, match=unsupported):
+        getattr(tool, unsupported)("local-one")
+    assert calls == [supported]
 
 
 @pytest.fixture
@@ -43,6 +96,10 @@ def fixture_path(tmp_path, materials):
 
 def test_default_planet_fixture_supports_search_and_read():
     tool = MockResearchTool()
+    assert tool.spec.name == "mock"
+    assert tool.spec.capabilities == ("search", "read")
+    assert tool.spec.source_types == ("mock",)
+    assert tool.spec.description
     summaries = tool.search("Planet Labs")
     assert [item["source_ref"] for item in summaries] == [
         "mock-src-001", "mock-src-002", "mock-src-003", "mock-src-004"
