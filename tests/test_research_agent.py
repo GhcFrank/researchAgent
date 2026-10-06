@@ -132,6 +132,12 @@ def fixture_tool(tmp_path, records):
     return RecordingTool(path)
 
 
+def assert_storage_empty(storage):
+    """Storage infrastructure may exist; no Research Objects may be persisted."""
+    for object_type in (Entity, Source, Evidence, Variable, Claim, Gap, Estimate, Event):
+        assert storage.list_objects(object_type) == [], f"Unexpected persisted {object_type.__name__}"
+
+
 def test_end_to_end_references_permissions_and_save_order(agent, task, tool, storage, materials, monkeypatch):
     calls = []
     insert = storage.insert
@@ -235,7 +241,7 @@ def test_forbidden_objects_rejected_before_any_write(agent, task, storage, monke
         monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [forbidden_object(kind)])
     with pytest.raises(AgentPermissionError, match=kind.__name__):
         agent.run(task)
-    assert not storage.data_dir.exists()
+    assert_storage_empty(storage)
 
 
 @pytest.mark.parametrize("path", ["deterministic", "backend"])
@@ -252,7 +258,7 @@ def test_forbidden_variable_input_rejected_before_any_write(agent, task, storage
         monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [variable])
     with pytest.raises(AgentPermissionError, match="Forbidden Variable input_type"):
         agent.run(task)
-    assert not storage.data_dir.exists()
+    assert_storage_empty(storage)
 
 
 def test_missing_figures_in_read_material_return_not_found(task, storage, tmp_path, materials):
@@ -301,7 +307,7 @@ def test_unsupported_scope_limit_fails_before_retrieval(agent, task, tool, stora
     with pytest.raises(ResearchAgentError, match="max_search_scope"):
         agent.run(task)
     assert tool.queries == [] and tool.read_refs == []
-    assert not storage.data_dir.exists()
+    assert_storage_empty(storage)
 
 
 def test_counter_evidence_reports_conflict_without_formal_claim(task, storage, tmp_path, materials):
@@ -349,7 +355,7 @@ def test_backend_conversion_metadata_lineage_and_rerun(task, storage, tmp_path, 
     insert = storage.insert
 
     def record_insert(obj):
-        assert len(backend.calls) == 2  # Both extractions finish before any write.
+        assert len(backend.calls) == 2  # Both extractions finish before any Research Object is persisted.
         writes.append(type(obj))
         return insert(obj)
 
@@ -533,7 +539,7 @@ def test_backend_invalid_references_rejected_before_write(task, storage, tmp_pat
     agent = ResearchAgent(fixture_tool(tmp_path, [materials[0]]), storage, PROMPT, extraction_backend=backend)
     with pytest.raises(ResearchAgentError, match=message):
         agent.run(task)
-    assert not storage.data_dir.exists()
+    assert_storage_empty(storage)
 
 
 def test_backend_no_material_reports_not_found_without_calling_backend(task, storage, tool, materials, backend_result):
@@ -544,7 +550,7 @@ def test_backend_no_material_reports_not_found_without_calling_backend(task, sto
     assert result.not_found[0].search_attempted == tool.queries
     assert result.candidate_gaps
     assert not result.search_coverage.period_covered and not result.search_coverage.scope_covered
-    assert not storage.data_dir.exists()
+    assert_storage_empty(storage)
 
 
 def test_cli_runs_example_with_temporary_data_directory(tmp_path):

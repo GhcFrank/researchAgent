@@ -1,9 +1,10 @@
 """Validated JSON persistence for the eight shared Research Object types.
 
 Object types in the public API are schema classes, e.g. ``list_objects(Source)``.
-Missing collection files represent empty collections. Writes use an atomic
-replacement of one file; concurrent writers and multi-file transactions are
-outside the v0.1 contract.
+Initialization creates missing collection files in the specified data_dir;
+existing collections are preserved. Missing collection files on read represent
+empty collections. Writes use an atomic replacement of one file; concurrent
+writers and multi-file transactions are outside the v0.1 contract.
 """
 
 import json
@@ -89,7 +90,17 @@ def _reject_json_constant(value: str) -> None:
 
 class ResearchStorage:
     def __init__(self, data_dir: str | Path = Path(__file__).resolve().parent / "data"):
+        """Initialize collections in data_dir, e.g. a workspace's objects_dir."""
         self.data_dir = Path(data_dir)
+        for object_type in _COLLECTIONS:
+            path, _ = self._collection(object_type)
+            try:
+                # lstat distinguishes absent files from existing dangling links.
+                path.lstat()
+            except FileNotFoundError:
+                self._write_collection(object_type, [])
+            except OSError as exc:
+                raise StorageError(f"Cannot inspect {path}: {exc}") from exc
 
     def _collection(self, object_type: type[ObjectT]) -> tuple[Path, str]:
         try:

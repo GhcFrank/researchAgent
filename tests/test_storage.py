@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from run_workspace import ResearchRunWorkspace
 from schemas import (
     Claim,
     ClaimEvidenceStatus,
@@ -136,6 +137,67 @@ def populated_storage(storage, objects):
     return storage
 
 
+def test_workspace_initializes_collections_and_persists_without_repo_pollution(tmp_path, objects):
+    repo_data = Path(storage_module.__file__).resolve().parent / "data"
+    repo_exists = repo_data.exists()
+    repo_before = {path.relative_to(repo_data): path.read_bytes() for path in repo_data.rglob("*") if path.is_file()}
+    workspace = ResearchRunWorkspace.create("PL", "company", root_dir=tmp_path / "runs")
+    assert list(workspace.objects_dir.iterdir()) == []
+    assert not workspace.root.is_relative_to(repo_data.parent)
+
+    storage = ResearchStorage(workspace.objects_dir)
+    assert storage.data_dir == workspace.objects_dir
+    assert {path.name for path in storage.data_dir.iterdir()} == {filename for filename, _ in FILES.values()}
+    for filename, _ in FILES.values():
+        assert json.loads((storage.data_dir / filename).read_text(encoding="utf-8")) == []
+
+    entity = objects[Entity].model_copy(update={"canonical_name": "PL"})
+    assert storage.insert(entity) == entity
+    assert storage.get_by_id(Entity, entity.entity_id) == entity
+    assert storage.list_objects(Entity) == [entity]
+    reopened = ResearchRunWorkspace.open(workspace.root, root_dir=tmp_path / "runs")
+    reloaded = ResearchStorage(reopened.objects_dir)
+    assert reloaded.get_by_id(Entity, entity.entity_id) == entity
+    assert reloaded.list_objects(Entity) == [entity]
+    assert repo_data.exists() == repo_exists
+    assert {path.relative_to(repo_data): path.read_bytes() for path in repo_data.rglob("*") if path.is_file()} == repo_before
+
+
+def test_workspace_storages_are_isolated(tmp_path, objects):
+    first = ResearchRunWorkspace.create("PL", "company", root_dir=tmp_path / "runs")
+    second = ResearchRunWorkspace.create("PL", "company", root_dir=tmp_path / "runs")
+    storage_a, storage_b = ResearchStorage(first.objects_dir), ResearchStorage(second.objects_dir)
+    entity_a = storage_a.insert(objects[Entity].model_copy(update={"canonical_name": "PL"}))
+    assert storage_b.list_objects(Entity) == []
+    with pytest.raises(ObjectNotFoundError, match=entity_a.entity_id):
+        storage_b.get_by_id(Entity, entity_a.entity_id)
+
+    # The same ID in another run is independent, not a duplicate in run A.
+    entity_b = storage_b.insert(entity_a.model_copy(update={"canonical_name": "Another run"}))
+    assert ResearchStorage(first.objects_dir).list_objects(Entity) == [entity_a]
+    assert ResearchStorage(second.objects_dir).list_objects(Entity) == [entity_b]
+
+
+def test_initialization_only_fills_missing_legacy_collections(tmp_path, objects):
+    data_dir = tmp_path / "legacy-data"
+    data_dir.mkdir()
+    entity_path, source_path = data_dir / "entities.json", data_dir / "sources.json"
+    entity_path.write_text(json.dumps([objects[Entity].model_dump(mode="json")]), encoding="utf-8")
+    source_path.write_text("{broken", encoding="utf-8")
+    before = {path: path.read_bytes() for path in (entity_path, source_path)}
+
+    storage = ResearchStorage(data_dir=data_dir)
+    assert storage.get_by_id(Entity, objects[Entity].entity_id) == objects[Entity]
+    for path, contents in before.items():
+        assert path.read_bytes() == contents
+    with pytest.raises(StorageCorruptionError, match="sources.json"):
+        storage.list_objects(Source)
+    assert {path.name for path in data_dir.iterdir()} == {filename for filename, _ in FILES.values()}
+    for model, (filename, _) in FILES.items():
+        if model not in (Entity, Source):
+            assert json.loads((data_dir / filename).read_text(encoding="utf-8")) == []
+
+
 def test_all_object_types_persist_and_reload(storage, objects):
     assert storage.list_objects(Entity) == []
     for model, obj in objects.items():
@@ -175,11 +237,12 @@ def test_update_replaces_only_matching_id(storage, objects):
 
 
 def test_missing_id_rejected_without_writing(storage, objects):
+    before = {path: path.read_bytes() for path in storage.data_dir.iterdir()}
     with pytest.raises(ObjectNotFoundError, match="entity-1"):
         storage.update(objects[Entity])
     with pytest.raises(ObjectNotFoundError, match="entity-1"):
         storage.get_by_id(Entity, "entity-1")
-    assert not storage.data_dir.exists()
+    assert {path: path.read_bytes() for path in storage.data_dir.iterdir()} == before
 
 
 def test_write_rejects_raw_dict_and_revalidates_model(storage, objects):
@@ -205,7 +268,6 @@ def test_corrupt_collection_rejected_without_overwrite(storage, objects, failure
         "schema": json.dumps([record, {"entity_id": "entity-invalid"}]),
         "duplicate_ids": json.dumps([record, record]),
     }
-    storage.data_dir.mkdir()
     path = storage.data_dir / "entities.json"
     path.write_text(contents[failure], encoding="utf-8")
     before = path.read_bytes()
@@ -277,6 +339,7 @@ def test_atomic_replace_failure_preserves_existing_file(storage, objects, monkey
     original = storage.insert(objects[Entity])
     path = storage.data_dir / "entities.json"
     before = path.read_bytes()
+    before_files = {entry: entry.read_bytes() for entry in storage.data_dir.iterdir()}
     changed = original.model_copy(update={"canonical_name": "Updated company"})
 
     def fail_replace(temporary, destination):
@@ -290,4 +353,4 @@ def test_atomic_replace_failure_preserves_existing_file(storage, objects, monkey
         storage.update(changed)
     assert path.read_bytes() == before
     assert storage.get_by_id(Entity, original.entity_id) == original
-    assert list(storage.data_dir.iterdir()) == [path]
+    assert {entry: entry.read_bytes() for entry in storage.data_dir.iterdir()} == before_files
