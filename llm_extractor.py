@@ -130,6 +130,7 @@ Apply these rules to facts relevant to the supplied ResearchTask, respecting its
 1. Extract every distinct factual statement directly stated in the supplied source that is
    relevant to the ResearchTask. Do not stop after extracting the primary metric.
 2. Split compound sentences into separate EvidenceCandidates for independently usable facts.
+   Apply the ATOMIC EVIDENCE RULE below; lists sharing one predicate remain one candidate.
    Each EvidenceCandidate must describe one atomic fact with its source-stated context.
    A sentence reporting total revenue and year-over-year growth produces separate evidence
    for the revenue amount and the growth rate. A sentence reporting segment revenue, its
@@ -143,6 +144,31 @@ Apply these rules to facts relevant to the supplied ResearchTask, respecting its
    not be converted into model inference or Claim. Preserve attribution and qualifiers.
 8. Before returning, review the source once more. Verify that every relevant explicit numeric
    fact was extracted and that every directly stated relevant narrative fact was considered.
+
+ATOMIC EVIDENCE RULE
+One EvidenceCandidate should represent one independently testable proposition.
+Use predicate structure, not punctuation alone, to decide whether to split.
+1. Multiple independent predicates must be split into separate EvidenceCandidates, even
+   when they occur in one sentence. Preserve each proposition's attribution and qualifiers.
+   For example, "Capacity could increase, but financing remains uncertain" produces two
+   statements: "Capacity could increase" and "Financing remains uncertain."
+2. One predicate with multiple objects must remain one EvidenceCandidate.
+   For example, "Orders came from retailers, wholesalers, and distributors" is one
+   proposition: orders came from the supplied list. Do not create one candidate per item
+   by repeating the shared predicate.
+3. Multiple quantitative predicates must be split. A sentence saying revenue was a
+   reported amount and increased by a reported year-over-year rate produces two candidates:
+   one for the revenue amount and one for the growth rate. Copy only source-stated values.
+4. A shared explanation or causal statement may remain one EvidenceCandidate.
+   "Growth reflected repeat orders and new distribution channels" has one shared predicate;
+   keep its contributing items together rather than creating separate causal statements.
+5. Before returning, check every EvidenceCandidate:
+   "Can part A be true or false independently of part B?"
+   If A and B are independent predicates, split them. If they are merely items, objects,
+   or examples sharing one predicate, keep them together. Apply this check to predicate
+   structure, not to individual objects in a shared-predicate list.
+Never split mechanically on commas, "and", or "but" alone.
+These examples illustrate the contract only; extract evidence only from the supplied source.
 
 VARIABLE COMPLETENESS
 For every directly stated relevant numeric fact, ask:

@@ -9,6 +9,7 @@ import sys
 import pytest
 
 import research_agent as agent_module
+from llm_extractor import ExtractionBackend, ExtractionError, ExtractionResult, ExtractionValidationError
 from research_agent import AgentPermissionError, ResearchAgent, ResearchAgentError
 from research_tools import MockResearchTool
 from schemas import (
@@ -53,6 +54,20 @@ class RecordingTool(MockResearchTool):
         return super().read(source_ref)
 
 
+class FakeExtractionBackend(ExtractionBackend):
+    def __init__(self, result, outcomes=None):
+        self.result = result
+        self.outcomes = outcomes or {}
+        self.calls = []
+
+    def extract(self, task, material, operating_rules):
+        self.calls.append({"task": task, "material": deepcopy(material), "operating_rules": operating_rules})
+        outcome = self.outcomes.get(material["source_ref"], self.result)
+        if isinstance(outcome, ExtractionError):
+            raise outcome
+        return outcome.model_copy(deep=True)
+
+
 @pytest.fixture
 def task():
     return ResearchTask.model_validate_json((ROOT / "examples" / "planet_growth.json").read_text(encoding="utf-8"))
@@ -76,6 +91,39 @@ def agent(tool, storage):
 @pytest.fixture
 def materials():
     return json.loads((ROOT / "fixtures" / "mock_planet_sources.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def backend_result():
+    return ExtractionResult.model_validate_json(json.dumps({
+        "entities": [{
+            "entity_type": "company", "canonical_name": "Planet Labs PBC",
+            "aliases": ["Planet Labs"], "ticker": "PL", "geography": "Global",
+        }],
+        "evidence": [
+            {"statement": "Total revenue was USD 80 million.", "value": 80, "unit": "million USD",
+             "entity_names": ["Planet Labs PBC"], "period": "FY27 Q2", "scope": "Total company",
+             "evidence_type": "Reported Fact", "source_locator": "B002", "notes": "Source-stated total."},
+            {"statement": "Data + Analytics revenue was USD 60 million.", "value": 60, "unit": "million USD",
+             "entity_names": ["Planet Labs PBC"], "period": "FY27 Q2", "scope": "Data + Analytics",
+             "evidence_type": "Reported Fact", "source_locator": "B002"},
+        ],
+        "variables": [
+            {"name": "Total revenue (FY27 Q2)", "definition": "Source-stated company revenue.",
+             "variable_type": "revenue", "entity_name": "Planet Labs PBC", "value": 80,
+             "unit": "million USD", "period": "FY27 Q2", "scope": "Total company",
+             "input_type": "Observed", "evidence_indexes": [0]},
+            {"name": "Data + Analytics revenue (FY27 Q2)", "definition": "Source-stated business revenue.",
+             "variable_type": "revenue", "entity_name": "Planet Labs PBC", "value": 60,
+             "unit": "million USD", "period": "FY27 Q2", "scope": "Data + Analytics",
+             "input_type": "Observed", "evidence_indexes": [1]},
+        ],
+        "potential_conflicts": [{"description": "An unresolved source qualification.", "evidence_ids": []}],
+        "not_found": [{"item": "Customer breakdown", "result": "Not disclosed in this source."}],
+        "candidate_gaps": [{"question": "What is the customer breakdown?", "why_it_matters": "Revenue context."}],
+        "follow_up_candidates": [{"topic": "Customer breakdown", "reason": "Find a direct disclosure."}],
+        "research_notes": "Fake extraction; no inference or calculations.",
+    }))
 
 
 def fixture_tool(tmp_path, records):
@@ -121,6 +169,7 @@ def test_end_to_end_references_permissions_and_save_order(agent, task, tool, sto
         assert storage.get_by_id(Entity, variable.entity_id)
         for evidence_id in variable.evidence_ids:
             assert storage.get_by_id(Evidence, evidence_id).value == variable.value
+    assert len(result.variables_created) == len(storage.list_objects(Variable)) == 3
     assert {item.name: (item.value, item.unit) for item in result.variables_created} == {
         "Data + Analytics revenue": (60, "million USD"),
         "Data + Analytics YoY revenue growth": (24, "%"),
@@ -176,24 +225,31 @@ def forbidden_object(kind):
     }[kind]()
 
 
+@pytest.mark.parametrize("path", ["deterministic", "backend"])
 @pytest.mark.parametrize("kind", [Claim, Gap, Estimate, Event], ids=lambda kind: kind.__name__)
-def test_forbidden_objects_rejected_before_any_write(agent, task, storage, monkeypatch, kind):
-    monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [forbidden_object(kind)])
+def test_forbidden_objects_rejected_before_any_write(agent, task, storage, monkeypatch, kind, path, backend_result):
+    if path == "backend":
+        backend_result.variables = [forbidden_object(kind)]
+        agent.extraction_backend = FakeExtractionBackend(backend_result)
+    else:
+        monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [forbidden_object(kind)])
     with pytest.raises(AgentPermissionError, match=kind.__name__):
         agent.run(task)
     assert not storage.data_dir.exists()
 
 
+@pytest.mark.parametrize("path", ["deterministic", "backend"])
 @pytest.mark.parametrize("input_type", [VariableInputType.MODEL_ESTIMATE, VariableInputType.DERIVED])
-def test_forbidden_variable_input_rejected_before_any_write(agent, task, storage, monkeypatch, input_type):
-    variable = Variable(
-        variable_id="forbidden-variable",
-        name="Forbidden model output",
-        variable_type="Financial",
-        input_type=input_type,
-        last_updated="2026-10-06T12:00:00Z",
-    )
-    monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [variable])
+def test_forbidden_variable_input_rejected_before_any_write(agent, task, storage, monkeypatch, input_type, path, backend_result):
+    if path == "backend":
+        backend_result.variables[0].input_type = input_type
+        agent.extraction_backend = FakeExtractionBackend(backend_result)
+    else:
+        variable = Variable(
+            variable_id="forbidden-variable", name="Forbidden model output", variable_type="Financial",
+            input_type=input_type, last_updated="2026-10-06T12:00:00Z",
+        )
+        monkeypatch.setattr(agent_module, "_extract_variables", lambda evidence: [variable])
     with pytest.raises(AgentPermissionError, match="Forbidden Variable input_type"):
         agent.run(task)
     assert not storage.data_dir.exists()
@@ -274,6 +330,221 @@ def test_other_period_is_not_substituted_for_requested_period(task, storage, tmp
     assert tool.read_refs
     assert not result.evidence_created and not result.variables_created
     assert result.not_found
+
+
+def test_backend_conversion_metadata_lineage_and_rerun(task, storage, tmp_path, materials, backend_result, monkeypatch):
+    records = materials[:2]
+    tool = fixture_tool(tmp_path, records)
+    second_extraction = backend_result.model_copy(deep=True)
+    for candidate in second_extraction.variables:
+        candidate.name = f"Planet Labs PBC {candidate.name}"
+        candidate.definition = "Alternate wording for the same observation."
+        candidate.variable_type = " revenue "
+        candidate.scope = f"  {candidate.scope.replace(' ', '   ')}  "
+        candidate.period = "  FY27   Q2  "
+        candidate.unit = "  million   USD  "
+    backend = FakeExtractionBackend(backend_result, {records[1]["source_ref"]: second_extraction})
+    agent = ResearchAgent(tool, storage, PROMPT, extraction_backend=backend)
+    writes = []
+    insert = storage.insert
+
+    def record_insert(obj):
+        assert len(backend.calls) == 2  # Both extractions finish before any write.
+        writes.append(type(obj))
+        return insert(obj)
+
+    monkeypatch.setattr(storage, "insert", record_insert)
+    result = agent.run(task)
+    assert [call["material"]["source_ref"] for call in backend.calls] == tool.read_refs
+    for call, raw in zip(backend.calls, records):
+        assert call["task"] == task
+        assert call["material"] == raw
+        assert call["operating_rules"] == PROMPT.read_text(encoding="utf-8")
+    assert len(tool.queries) == 1
+    assert len(result.entities_created) == 1
+    assert len(result.sources_created) == 2
+    assert len(result.evidence_created) == 4
+    assert len(result.variables_created) == len(storage.list_objects(Variable)) == 2
+    entity = result.entities_created[0]
+    assert (entity.canonical_name, entity.ticker, entity.geography) == ("Planet Labs PBC", "PL", "Global")
+    ranks = {Entity: 0, Source: 1, Evidence: 2, Variable: 3}
+    assert [ranks[kind] for kind in writes] == sorted(ranks[kind] for kind in writes)
+    for source, raw in zip(result.sources_created, records):
+        for field in ("title", "publisher", "source_type", "published_date", "locator"):
+            assert getattr(source, field) == raw[field]
+        assert source.primary_or_secondary is SourceOrigin.PRIMARY
+        evidence = [item for item in result.evidence_created if item.source_id == source.source_id]
+        for item, candidate in zip(evidence, backend_result.evidence):
+            assert item.source_locator == "B002" and item.source_locator != source.locator
+            assert item.entity_ids == [entity.entity_id]
+            assert item.model_dump(exclude={"evidence_id", "source_id", "entity_ids", "collected_at"}) == candidate.model_dump(exclude={"entity_names"})
+    for item, candidate in zip(result.variables_created, backend_result.variables):
+        assert item.entity_id == entity.entity_id
+        expected_ids = []
+        for source in result.sources_created:
+            evidence = [ev for ev in result.evidence_created if ev.source_id == source.source_id]
+            expected_ids.extend(evidence[index].evidence_id for index in candidate.evidence_indexes)
+        assert item.evidence_ids == expected_ids
+        sources = [storage.get_by_id(Source, storage.get_by_id(Evidence, eid).source_id)
+                   for eid in item.evidence_ids]
+        assert [source.source_id for source in sources] == [source.source_id for source in result.sources_created]
+        assert all(source.independence_group for source in sources)
+        assert item.input_type is VariableInputType.OBSERVED
+        assert item.model_dump(exclude={"variable_id", "entity_id", "evidence_ids", "last_updated", "input_type"}) == candidate.model_dump(exclude={"entity_name", "evidence_indexes", "input_type"})
+    assert result.search_coverage.primary_source_found
+    assert result.search_coverage.period_covered and result.search_coverage.scope_covered
+    assert result.potential_conflicts == backend_result.potential_conflicts * 2
+    assert all(not item.evidence_ids for item in result.potential_conflicts)
+    assert all(item.search_attempted == tool.queries for item in result.not_found)
+    assert result.candidate_gaps == backend_result.candidate_gaps * 2
+    assert result.follow_up_candidates == backend_result.follow_up_candidates * 2
+    assert result.research_notes == "\n\n".join([backend_result.research_notes] * 2)
+    for kind in (Claim, Gap, Estimate, Event):
+        assert storage.list_objects(kind) == []
+    assert ResearchStorage(storage.data_dir).list_objects(Variable) == result.variables_created
+
+    before = {path.name: path.read_bytes() for path in storage.data_dir.iterdir()}
+    second = agent.run(task)
+    assert second.sources_reused == [item.source_id for item in result.sources_created]
+    assert not second.sources_created and not second.entities_created
+    assert not second.evidence_created and not second.variables_created
+    assert len(backend.calls) == 4
+    assert storage.list_objects(Variable) == result.variables_created
+    assert {path.name: path.read_bytes() for path in storage.data_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize(("field", "different"), [
+    ("value", 65),
+    ("value", 60.5),
+    ("value", "60"),
+    ("scope", "Total company"),
+    ("period", "FY27 Q1"),
+])
+def test_distinct_observations_are_not_consolidated(task, storage, tmp_path, materials, backend_result, field, different):
+    backend_result.variables = [backend_result.variables[1]]
+    second_extraction = backend_result.model_copy(deep=True)
+    setattr(second_extraction.variables[0], field, different)
+    backend = FakeExtractionBackend(backend_result, {materials[1]["source_ref"]: second_extraction})
+    agent = ResearchAgent(fixture_tool(tmp_path, materials[:2]), storage, PROMPT, extraction_backend=backend)
+
+    result = agent.run(task)
+
+    variables = storage.list_objects(Variable)
+    assert len(variables) == len(result.variables_created) == 2
+    assert [getattr(item, field) for item in variables] == [getattr(backend_result.variables[0], field), different]
+    assert all(len(item.evidence_ids) == 1 for item in variables)
+    assert len({storage.get_by_id(Evidence, item.evidence_ids[0]).source_id for item in variables}) == 2
+    assert result.potential_conflicts == backend_result.potential_conflicts * 2
+
+
+def test_existing_observation_updates_lineage_once_and_keeps_id(task, storage, tmp_path, materials, backend_result, monkeypatch):
+    backend_result.variables = [backend_result.variables[1]]
+    first = ResearchAgent(
+        fixture_tool(tmp_path, [materials[0]]), storage, PROMPT,
+        extraction_backend=FakeExtractionBackend(backend_result),
+    ).run(task)
+    original = first.variables_created[0]
+    backend_result.variables[0].name = "Planet Labs PBC Data + Analytics revenue"
+    backend_result.variables[0].definition = "Different wording from another source."
+    # Repeated support indexes must not produce duplicate persistent IDs.
+    backend_result.variables[0].evidence_indexes = [1, 1]
+    agent = ResearchAgent(
+        fixture_tool(tmp_path, [materials[1]]), storage, PROMPT,
+        extraction_backend=FakeExtractionBackend(backend_result),
+    )
+    updates = []
+    update = storage.update
+
+    def record_update(obj):
+        assert all(storage.get_by_id(Evidence, eid) for eid in obj.evidence_ids)
+        updates.append(obj)
+        return update(obj)
+
+    monkeypatch.setattr(storage, "update", record_update)
+    second = agent.run(task)
+    consolidated = ResearchStorage(storage.data_dir).list_objects(Variable)
+    assert len(consolidated) == len(updates) == 1
+    variable = consolidated[0]
+    assert not second.variables_created
+    assert variable.variable_id == original.variable_id
+    assert (variable.name, variable.definition) == (original.name, original.definition)
+    assert variable.evidence_ids == [*original.evidence_ids, second.evidence_created[1].evidence_id]
+    evidence = [storage.get_by_id(Evidence, eid) for eid in variable.evidence_ids]
+    assert [item.source_id for item in evidence] == [first.sources_created[0].source_id, second.sources_created[0].source_id]
+
+    before = {path.name: path.read_bytes() for path in storage.data_dir.iterdir()}
+    rerun = agent.run(task)
+    assert not rerun.variables_created and not rerun.evidence_created
+    assert len(updates) == 1
+    assert storage.list_objects(Variable) == consolidated
+    assert {path.name: path.read_bytes() for path in storage.data_dir.iterdir()} == before
+
+
+def test_backend_reuses_existing_entity_and_source(task, storage, tmp_path, materials, backend_result):
+    entity = storage.insert(Entity(
+        entity_id="existing-company", entity_type="company", canonical_name="planet labs pbc",
+        aliases=["Planet Labs"],
+    ))
+    raw = materials[0]
+    source = storage.insert(Source(
+        source_id="existing-release", title=raw["title"], publisher=raw["publisher"],
+        source_type=raw["source_type"], published_date=raw["published_date"],
+        accessed_date="2026-10-01", locator=raw["locator"], primary_or_secondary=SourceOrigin.PRIMARY,
+    ))
+    backend = FakeExtractionBackend(backend_result)
+    result = ResearchAgent(fixture_tool(tmp_path, [raw]), storage, PROMPT, extraction_backend=backend).run(task)
+    assert not result.entities_created and not result.sources_created
+    assert result.sources_reused == [source.source_id]
+    assert all(item.source_id == source.source_id and item.entity_ids == [entity.entity_id] for item in result.evidence_created)
+    assert all(item.entity_id == entity.entity_id for item in result.variables_created)
+    assert storage.list_objects(Entity) == [entity]
+    assert storage.list_objects(Source) == [source]
+
+
+def test_backend_later_extraction_failure_keeps_storage_unchanged(task, storage, tmp_path, materials, backend_result):
+    storage.insert(Entity(entity_id="preexisting", entity_type="company", canonical_name="Existing company"))
+    before = {path.name: path.read_bytes() for path in storage.data_dir.iterdir()}
+    failure = ExtractionValidationError("simulated extraction failure")
+    backend = FakeExtractionBackend(backend_result, {materials[1]["source_ref"]: failure})
+    agent = ResearchAgent(fixture_tool(tmp_path, materials[:2]), storage, PROMPT, extraction_backend=backend)
+    with pytest.raises(ResearchAgentError, match="Extraction backend failed") as exc:
+        agent.run(task)
+    assert exc.value.__cause__ is failure
+    assert len(backend.calls) == 2
+    assert {path.name: path.read_bytes() for path in storage.data_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize(("failure", "message"), [
+    ("evidence-entity", "No EntityCandidate resolves"),
+    ("variable-entity", "No EntityCandidate resolves"),
+    ("evidence-index", "evidence index"),
+    ("locator", "source_locator"),
+])
+def test_backend_invalid_references_rejected_before_write(task, storage, tmp_path, materials, backend_result, failure, message):
+    if failure == "evidence-entity":
+        backend_result.evidence[1].entity_names = ["Unresolved company"]
+    elif failure == "variable-entity":
+        backend_result.variables[1].entity_name = "Unresolved company"
+    elif failure == "evidence-index":
+        backend_result.variables[1].evidence_indexes = [99]
+    else:
+        backend_result.evidence[1].source_locator = "B999"
+    backend = FakeExtractionBackend(backend_result)
+    agent = ResearchAgent(fixture_tool(tmp_path, [materials[0]]), storage, PROMPT, extraction_backend=backend)
+    with pytest.raises(ResearchAgentError, match=message):
+        agent.run(task)
+    assert not storage.data_dir.exists()
+
+
+def test_backend_no_material_reports_not_found_without_calling_backend(task, storage, tool, materials, backend_result):
+    task.constraints.excluded_sources = [item["source_ref"] for item in materials]
+    backend = FakeExtractionBackend(backend_result)
+    result = ResearchAgent(tool, storage, PROMPT, extraction_backend=backend).run(task)
+    assert backend.calls == [] and tool.read_refs == []
+    assert result.not_found[0].search_attempted == tool.queries
+    assert result.candidate_gaps
+    assert not result.search_coverage.period_covered and not result.search_coverage.scope_covered
+    assert not storage.data_dir.exists()
 
 
 def test_cli_runs_example_with_temporary_data_directory(tmp_path):

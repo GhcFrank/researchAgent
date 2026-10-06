@@ -1,4 +1,4 @@
-"""Offline Research Agent v0.1 with narrowly defined mock extraction."""
+"""Research Agent with deterministic mock extraction or an injected backend."""
 
 import argparse
 from datetime import datetime, timezone
@@ -10,6 +10,15 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import ValidationError
 
+from llm_extractor import (
+    EntityCandidate,
+    EvidenceCandidate,
+    ExtractionBackend,
+    ExtractionError,
+    ExtractionResult,
+    VariableCandidate,
+    build_locatable_content,
+)
 from research_tools import MockResearchTool, ResearchMaterial, ResearchTool, ResearchToolError
 from schemas import (
     CandidateGap,
@@ -78,6 +87,23 @@ _METRICS = {
 def _stable_id(prefix: str, *parts) -> str:
     key = json.dumps([prefix, *parts], ensure_ascii=False, sort_keys=True)
     return f"{prefix}-{uuid5(NAMESPACE_URL, key).hex}"
+
+
+def _observation_key(variable: Variable) -> tuple:
+    """Compare measurement context without names or source-specific lineage."""
+    def canonical(text: str | None) -> str | None:
+        return " ".join(text.split()) if text is not None else None
+
+    return (
+        canonical(variable.entity_id),
+        canonical(variable.variable_type),
+        canonical(variable.period),
+        canonical(variable.scope),
+        # Values are never cleaned or coerced; bool, number and string differ.
+        (type(variable.value).__name__, variable.value),
+        canonical(variable.unit),
+        canonical(variable.input_type.value),
+    )
 
 
 def _period(text: str) -> str | None:
@@ -309,21 +335,77 @@ def _potential_conflicts(evidence: list[Evidence]) -> list[PotentialConflict]:
     ]
 
 
+def _validate_backend_result(result, material: ResearchMaterial) -> ExtractionResult:
+    if type(result) is not ExtractionResult:
+        raise ResearchAgentError("Extraction backend must return an ExtractionResult")
+    for candidates, candidate_type in (
+        (result.entities, EntityCandidate),
+        (result.evidence, EvidenceCandidate),
+        (result.variables, VariableCandidate),
+    ):
+        for candidate in candidates:
+            if type(candidate) is not candidate_type:
+                raise AgentPermissionError(
+                    f"Backend cannot supply {type(candidate).__name__}; expected {candidate_type.__name__}"
+                )
+    for candidate in result.variables:
+        if candidate.input_type not in _ALLOWED_INPUTS:
+            raise AgentPermissionError(f"Forbidden Variable input_type: {candidate.input_type}")
+    try:
+        result = ExtractionResult.model_validate(result.model_dump(warnings=False))
+    except ValidationError as exc:
+        raise ResearchAgentError(f"Invalid backend ExtractionResult: {exc}") from exc
+    block_ids = set(build_locatable_content(material["content"]))
+    for candidate in result.evidence:
+        if candidate.source_locator not in block_ids:
+            raise ResearchAgentError(f"Invalid backend source_locator: {candidate.source_locator!r}")
+    return result
+
+
+def _resolve_entity_name(name: str, entity_map: dict[str, str]) -> str:
+    try:
+        return entity_map[name.strip().casefold()]
+    except KeyError as exc:
+        raise ResearchAgentError(f"No EntityCandidate resolves entity name {name!r}") from exc
+
+
 class ResearchAgent:
     def __init__(
         self,
         tool: ResearchTool,
         storage: ResearchStorage,
         prompt_path: Path | str = _PROJECT_DIR / "prompts" / "research_agent.md",
+        *,
+        extraction_backend: ExtractionBackend | None = None,
     ):
         self.tool = tool
         self.storage = storage
+        self.extraction_backend = extraction_backend
         try:
             self.prompt = Path(prompt_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             raise ResearchAgentError(f"Cannot load operating rules from {prompt_path}: {exc}") from exc
         if not self.prompt.strip():
             raise ResearchAgentError("Research Agent operating rules are empty")
+
+    def _prepare_sources(self, materials, timestamp):
+        sources_created, sources_reused, sources = [], [], []
+        staged_locators, staged_metadata = {}, {}
+        for material in materials:
+            candidate = _validate_batch([_extract_source(material, timestamp)], Source)[0]
+            metadata = (candidate.title, candidate.publisher, candidate.published_date)
+            duplicate = self.storage.find_duplicate_source(candidate)
+            duplicate = duplicate or staged_locators.get(candidate.locator) or staged_metadata.get(metadata)
+            source = duplicate or candidate
+            sources.append(source)
+            if duplicate:
+                if source.source_id not in sources_reused:
+                    sources_reused.append(source.source_id)
+            else:
+                sources_created.append(source)
+                staged_locators[source.locator] = source
+                staged_metadata[metadata] = source
+        return sources_created, sources_reused, sources
 
     def _new_objects(self, objects, object_type, id_field):
         new_objects = {}
@@ -338,6 +420,157 @@ class ResearchAgent:
             elif existing.model_dump(exclude={"collected_at", "last_updated"}) != obj.model_dump(exclude={"collected_at", "last_updated"}):
                 raise ResearchAgentError(f"Conflicting content for deterministic {object_type.__name__} ID {object_id}")
         return list(new_objects.values())
+
+    def _consolidate_variables(self, variables: list[Variable]) -> tuple[list[Variable], list[Variable]]:
+        """Stage inserts and lineage updates before any persistence starts."""
+        observations = {}
+        for existing in self.storage.list_objects(Variable):
+            # Reuse the first stored observation, including legacy Variable IDs.
+            observations.setdefault(_observation_key(existing), existing)
+        created, updated = {}, {}
+        for candidate in variables:
+            key = _observation_key(candidate)
+            existing = observations.get(key)
+            if existing is None:
+                item = candidate.model_copy(update={
+                    "variable_id": _stable_id("VARIABLE", key),
+                    "evidence_ids": list(dict.fromkeys(candidate.evidence_ids)),
+                })
+                observations[key] = created[key] = item
+                continue
+            # Preserve old lineage order; append each new persistent ID once.
+            evidence_ids = list(dict.fromkeys([*existing.evidence_ids, *candidate.evidence_ids]))
+            if evidence_ids != existing.evidence_ids:
+                item = existing.model_copy(update={
+                    "evidence_ids": evidence_ids,
+                    "last_updated": candidate.last_updated,
+                })
+                observations[key] = item
+                if key in created:
+                    created[key] = item
+                else:
+                    updated[key] = item
+        return (
+            _validate_batch(list(created.values()), Variable),
+            _validate_batch(list(updated.values()), Variable),
+        )
+
+    def _run_backend(self, task, materials, attempts, timestamp) -> ResearchResult:
+        extractions = []
+        for material in materials:
+            try:
+                extracted = self.extraction_backend.extract(
+                    task=task, material=material, operating_rules=self.prompt,
+                )
+            except ExtractionError as exc:
+                raise ResearchAgentError(f"Extraction backend failed for {material['source_ref']}: {exc}") from exc
+            extractions.append(_validate_backend_result(extracted, material))
+
+        # All extractions have succeeded before conversion or persistence starts.
+        sources_created, sources_reused, sources = self._prepare_sources(materials, timestamp)
+        existing_entities = {item.canonical_name.strip().casefold(): item for item in self.storage.list_objects(Entity)}
+        entities_created, entity_maps = [], []
+        for extracted in extractions:
+            entity_map = {}
+            for candidate in extracted.entities:
+                key = candidate.canonical_name.strip().casefold()
+                entity = existing_entities.get(key)
+                if entity is None:
+                    entity = Entity(entity_id=_stable_id("ENTITY", key), **candidate.model_dump())
+                    entities_created.append(entity)
+                    existing_entities[key] = entity
+                entity_map[key] = entity.entity_id
+            entity_maps.append(entity_map)
+
+        evidence, variables = [], []
+        for extracted, source, entity_map in zip(extractions, sources, entity_maps):
+            evidence_index_to_id = {}
+            for index, candidate in enumerate(extracted.evidence):
+                fields = candidate.model_dump(exclude={"entity_names"})
+                fields["entity_ids"] = [_resolve_entity_name(name, entity_map) for name in candidate.entity_names]
+                item = Evidence(
+                    evidence_id=_stable_id("EVIDENCE", source.source_id, fields),
+                    source_id=source.source_id, collected_at=timestamp, **fields,
+                )
+                evidence.append(item)
+                evidence_index_to_id[index] = item.evidence_id
+            for candidate in extracted.variables:
+                try:
+                    evidence_ids = [evidence_index_to_id[index] for index in candidate.evidence_indexes]
+                except KeyError as exc:
+                    raise ResearchAgentError(f"Unresolved candidate evidence index: {exc.args[0]}") from exc
+                fields = candidate.model_dump(exclude={"entity_name", "evidence_indexes", "input_type"})
+                fields.update(
+                    entity_id=_resolve_entity_name(candidate.entity_name, entity_map) if candidate.entity_name is not None else None,
+                    evidence_ids=evidence_ids,
+                    input_type=VariableInputType(candidate.input_type.value),
+                )
+                variables.append(Variable(
+                    variable_id=_stable_id("VARIABLE", fields), last_updated=timestamp, **fields,
+                ))
+
+        entities_created = _validate_batch(entities_created, Entity)
+        sources_created = _validate_batch(sources_created, Source)
+        evidence = _validate_batch(evidence, Evidence)
+        variables = _validate_batch(variables, Variable)
+        evidence_created = self._new_objects(evidence, Evidence, "evidence_id")
+        variables_created, variables_updated = self._consolidate_variables(variables)
+
+        entities_by_id = {item.entity_id: item for item in existing_entities.values()}
+        requested_entity = task.scope.entity.strip().casefold()
+        requested_business = task.scope.product_or_business
+        requested_geography = task.scope.geography
+        scope_covered = False
+        for item in evidence:
+            linked_entities = [entities_by_id[entity_id] for entity_id in item.entity_ids]
+            entity_covered = not requested_entity or any(
+                requested_entity in {name.strip().casefold() for name in [entity.canonical_name, *entity.aliases]}
+                for entity in linked_entities
+            )
+            business_covered = requested_business is None or (
+                item.scope is not None and item.scope.strip().casefold() == requested_business.strip().casefold()
+            )
+            geography_covered = requested_geography is None or any(
+                entity.geography is not None and entity.geography.strip().casefold() == requested_geography.strip().casefold()
+                for entity in linked_entities
+            )
+            scope_covered |= entity_covered and business_covered and geography_covered
+        not_found = [item.model_copy(update={"search_attempted": list(attempts)})
+                     for extracted in extractions for item in extracted.not_found]
+        candidate_gaps = [item for extracted in extractions for item in extracted.candidate_gaps]
+        if not materials:
+            not_found.append(NotFoundItem(
+                item=task.target_requirement.question, search_attempted=attempts,
+                result="No qualifying source material found",
+            ))
+            candidate_gaps.append(CandidateGap(question=task.target_requirement.question))
+        result = ResearchResult(
+            task_id=task.task_id,
+            entities_created=entities_created,
+            sources_created=sources_created,
+            sources_reused=sources_reused,
+            evidence_created=evidence_created,
+            variables_created=variables_created,
+            search_coverage=SearchCoverage(
+                source_types_checked=list(dict.fromkeys(item["source_type"] for item in materials)),
+                primary_source_found=any(item.primary_or_secondary is SourceOrigin.PRIMARY for item in sources),
+                period_covered=any(task.scope.period is None or (
+                    item.period is not None and item.period.strip().casefold() == task.scope.period.strip().casefold()
+                ) for item in evidence),
+                scope_covered=scope_covered,
+            ),
+            potential_conflicts=[item for extracted in extractions for item in extracted.potential_conflicts],
+            not_found=not_found,
+            candidate_gaps=candidate_gaps,
+            follow_up_candidates=[item for extracted in extractions for item in extracted.follow_up_candidates],
+            research_notes="\n\n".join(extracted.research_notes for extracted in extractions if extracted.research_notes) or None,
+        )
+        for batch in (entities_created, sources_created, evidence_created, variables_created):
+            for obj in batch:
+                self.storage.insert(obj)
+        for obj in variables_updated:
+            self.storage.update(obj)
+        return result
 
     def run(self, task: ResearchTask) -> ResearchResult:
         if type(task) is not ResearchTask:
@@ -362,6 +595,9 @@ class ResearchAgent:
         ))
         materials = [self.tool.read(ref) for ref in dict.fromkeys(item["source_ref"] for item in summaries)]
 
+        if self.extraction_backend is not None:
+            return self._run_backend(task, materials, attempts, timestamp)
+
         entities = _validate_batch(_extract_entities(materials, task), Entity)
         existing_entities = {item.canonical_name.strip().casefold(): item for item in self.storage.list_objects(Entity)}
         entities_created = []
@@ -373,22 +609,7 @@ class ResearchAgent:
                 entities_created.append(candidate)
                 existing_entities[candidate.canonical_name.strip().casefold()] = candidate
 
-        sources_created, sources_reused, sources = [], [], []
-        staged_locators, staged_metadata = {}, {}
-        for material in materials:
-            candidate = _validate_batch([_extract_source(material, timestamp)], Source)[0]
-            metadata = (candidate.title, candidate.publisher, candidate.published_date)
-            duplicate = self.storage.find_duplicate_source(candidate)
-            duplicate = duplicate or staged_locators.get(candidate.locator) or staged_metadata.get(metadata)
-            source = duplicate or candidate
-            sources.append(source)
-            if duplicate:
-                if source.source_id not in sources_reused:
-                    sources_reused.append(source.source_id)
-            else:
-                sources_created.append(source)
-                staged_locators[source.locator] = source
-                staged_metadata[metadata] = source
+        sources_created, sources_reused, sources = self._prepare_sources(materials, timestamp)
 
         evidence = []
         entity_ids = [item.entity_id for item in effective_entities]
@@ -403,7 +624,7 @@ class ResearchAgent:
         evidence = _validate_batch(evidence, Evidence)
         variables = _validate_batch(variables, Variable)
         evidence_created = self._new_objects(evidence, Evidence, "evidence_id")
-        variables_created = self._new_objects(variables, Variable, "variable_id")
+        variables_created, variables_updated = self._consolidate_variables(variables)
 
         requested = _requested_metrics(task)
         found = {_metric_key(item) for item in evidence}
@@ -422,7 +643,7 @@ class ResearchAgent:
                 reason="The mock business brief explicitly says this breakdown is undisclosed; no further search was started.",
             ))
 
-        notes = "Offline deterministic mock extraction; no general NLP or model inference. Existing Evidence/Variable IDs are reused without updates."
+        notes = "Offline deterministic mock extraction; no general NLP or model inference. Existing Evidence IDs are reused; matching Variable observations aggregate evidence lineage."
         if task.search_mode is SearchMode.COUNTER_EVIDENCE:
             notes += " Counter-evidence mode checks the same bounded sources for divergent reported values; it does not resolve conflicts."
         if task.scope.geography is not None:
@@ -450,6 +671,8 @@ class ResearchAgent:
         for batch in (entities_created, sources_created, evidence_created, variables_created):
             for obj in batch:
                 self.storage.insert(obj)
+        for obj in variables_updated:
+            self.storage.update(obj)
         return result
 
 
