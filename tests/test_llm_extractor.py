@@ -22,6 +22,7 @@ from llm_extractor import (
     normalize_variable_candidate,
 )
 from schemas import ResearchTask
+from source_segmentation import build_source_blocks, render_blocks
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +100,7 @@ def payload():
 
 
 @pytest.mark.parametrize(("content", "expected"), [
+    (" \t\n\n", {}),
     ("paragraph one\n\nparagraph two", {"B001": "paragraph one", "B002": "paragraph two"}),
     (
         "\r\n  paragraph one\r\n  indented  \r\nend \r\n \t\r\n\r\n paragraph two \r\n",
@@ -108,8 +110,11 @@ def payload():
 def test_locatable_blocks_are_deterministic_and_preserve_text(content, expected):
     first = build_locatable_content(content)
     assert first == expected
-    assert list(first) == ["B001", "B002"]
+    assert list(first) == list(expected)
     assert build_locatable_content(content) == first
+    blocks = build_source_blocks(content)
+    assert first == {block.block_id: block.text for block in blocks}
+    assert render_blocks(blocks) == "\n\n".join(f"[{block_id}]\n{text}" for block_id, text in expected.items())
 
 
 @pytest.mark.parametrize(("variants", "expected"), [

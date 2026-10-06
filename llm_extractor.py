@@ -15,6 +15,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from schemas import CandidateGap, FollowUpCandidate, NonBlankString, NotFoundItem, PotentialConflict, ResearchTask
+from source_segmentation import build_source_blocks, render_blocks
 
 
 class ExtractionError(Exception):
@@ -206,8 +207,7 @@ def build_locatable_content(content: str) -> dict[str, str]:
     Blank lines, including whitespace-only lines, separate blocks. Only each
     block's outer whitespace is trimmed; LF and CRLF inside a block are kept.
     """
-    paragraphs = [block.strip() for block in re.split(r"\r?\n[^\S\r\n]*\r?\n", content) if block.strip()]
-    return {f"B{index:03d}": block for index, block in enumerate(paragraphs, start=1)}
+    return {block.block_id: block.text for block in build_source_blocks(content)}
 
 
 def normalize_variable_candidate(candidate: VariableCandidate) -> VariableCandidate:
@@ -251,11 +251,9 @@ def _messages(task: ResearchTask, material: dict, operating_rules: str) -> list[
         if not isinstance(value, str) or not value.strip():
             raise ExtractionValidationError(f"material.{field} must be a non-blank string")
 
-    blocks = build_locatable_content(material["content"])
+    blocks = build_source_blocks(material["content"])
     source_material = {field: material[field] for field in _MATERIAL_FIELDS}
-    source_material["content"] = "SOURCE CONTENT WITH LOCATORS\n\n" + "\n\n".join(
-        f"[{block_id}]\n{text}" for block_id, text in blocks.items()
-    )
+    source_material["content"] = "SOURCE CONTENT WITH LOCATORS\n\n" + render_blocks(blocks)
     schema = json.dumps(ExtractionResult.model_json_schema(), ensure_ascii=False)
     example = ExtractionResult().model_dump_json()
     return [
