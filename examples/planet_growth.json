@@ -1,0 +1,23 @@
+{
+  "task_id": "TASK-001",
+  "research_question": "Planet Labs 当前增长主要来自什么业务？",
+  "target_requirement": {
+    "requirement_id": "HR-03",
+    "question": "Data + Analytics 在 FY27 Q2 的增长和收入贡献是多少？",
+    "core_requirement": true
+  },
+  "search_mode": "normal",
+  "scope": {
+    "entity": "Planet Labs PBC",
+    "period": "FY27 Q2",
+    "geography": null,
+    "product_or_business": "Data + Analytics"
+  },
+  "preferred_source_types": ["earnings release", "earnings call", "company IR"],
+  "existing_object_ids": [],
+  "specific_search_instruction": "寻找 Data + Analytics 的收入、增长率和收入贡献，以及相关管理层说明。",
+  "constraints": {
+    "max_search_scope": null,
+    "excluded_sources": []
+  }
+}
