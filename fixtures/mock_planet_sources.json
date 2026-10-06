@@ -1,0 +1,42 @@
+[
+  {
+    "source_ref": "mock-src-001",
+    "title": "[MOCK] Planet Labs FY27 Q2 earnings release",
+    "publisher": "Planet Labs (MOCK FIXTURE)",
+    "source_type": "Earnings Release",
+    "published_date": "2026-09-10",
+    "locator": "mock://planet/fy27-q2/earnings-release",
+    "content": "MOCK / FIXTURE DATA ONLY. This is an invented Planet Labs earnings release for offline testing, not a real disclosure or current research.\n\nTable 1 — fictional FY27 Q2 revenue: Total revenue was USD 80 million, up 20% year over year. Data + Analytics revenue was USD 60 million, up 24% year over year, and represented 75% of total revenue. Other businesses contributed USD 20 million.\n\nBusiness commentary: Data + Analytics was the main growth contributor in this mock quarter. Demand came from government monitoring subscriptions, sovereign customers, and expanded analytics subscriptions. All figures and explanations are synthetic.",
+    "tags": ["mock", "fixture", "Planet Labs", "FY27 Q2", "Data + Analytics", "growth", "revenue", "增长", "收入贡献"]
+  },
+  {
+    "source_ref": "mock-src-002",
+    "title": "[MOCK] Planet Labs FY27 Q2 earnings call transcript",
+    "publisher": "Planet Labs (MOCK FIXTURE)",
+    "source_type": "Earnings Call Transcript",
+    "published_date": "2026-09-10",
+    "locator": "mock://planet/fy27-q2/earnings-call",
+    "content": "MOCK / FIXTURE DATA ONLY. This invented transcript is not an actual Planet Labs call.\n\nCFO section: In our fictional FY27 Q2, Data + Analytics generated USD 60 million of revenue. Its 24% year-over-year growth and 75% contribution to total revenue reflect monitoring subscription renewals and additional analytics services sold to government and sovereign customers.\n\nCEO section: Data + Analytics is the main current growth business in this fixture. Newly announced sovereign contracts may support future growth, but contract value is not the same as recognized quarterly revenue. This transcript repeats the same mock earnings disclosure and is not an independent financial measurement.",
+    "tags": ["mock", "fixture", "Planet Labs", "FY27 Q2", "Data + Analytics", "growth", "government", "sovereign", "增长"]
+  },
+  {
+    "source_ref": "mock-src-003",
+    "title": "[MOCK] Planet Labs sovereign monitoring contract announcement",
+    "publisher": "Planet Labs (MOCK FIXTURE)",
+    "source_type": "Contract Announcement",
+    "published_date": "2026-09-18",
+    "locator": "mock://planet/sovereign/contract-announcement",
+    "content": "MOCK / FIXTURE DATA ONLY. The customer, agreement, timing, and monetary amounts below are invented for offline tests.\n\nAnnouncement paragraph 1: Mock Planet Labs signed a four-year sovereign monitoring agreement with a fictional government customer. Total mock contract value is USD 50 million and covers imagery delivery and monitoring services.\n\nTiming paragraph 2: Services are scheduled to begin in FY28. No revenue from this new contract was recognized in FY27 Q2. The announcement describes possible future growth, not an additional USD 50 million of current-quarter revenue.",
+    "tags": ["mock", "fixture", "Planet Labs", "sovereign", "contract", "growth", "主权合同"]
+  },
+  {
+    "source_ref": "mock-src-004",
+    "title": "[MOCK] Planet Labs Data + Analytics business brief",
+    "publisher": "Mock Research Desk",
+    "source_type": "Business Brief",
+    "published_date": "2026-09-20",
+    "locator": "mock://planet/data-analytics/business-brief",
+    "content": "MOCK / FIXTURE DATA ONLY. This synthetic business brief is not real analyst research.\n\nDefinition paragraph: In this fixture, Planet Labs Data + Analytics includes satellite imagery subscriptions, archive access, monitoring services, and analytics products.\n\nRevenue paragraph: The mock FY27 Q2 earnings release reports USD 60 million for Data + Analytics, 24% year-over-year growth, and 75% of total company revenue. This brief cites the same fictional release rather than providing an independent estimate.\n\nScope paragraph: Revenue share, revenue growth, and multi-year contract value are different reported measures. The mock materials do not disclose a detailed breakdown between government and commercial revenue within Data + Analytics.",
+    "tags": ["mock", "fixture", "Planet Labs", "FY27 Q2", "Data + Analytics", "growth", "revenue", "增长", "收入贡献"]
+  }
+]
