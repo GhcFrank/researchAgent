@@ -18,6 +18,8 @@ from llm_extractor import (
     ExtractionValidationError,
     LLMProviderError,
     VariableCandidate,
+    build_locatable_content,
+    normalize_variable_candidate,
 )
 from schemas import ResearchTask
 
@@ -60,7 +62,7 @@ def inputs():
         "source_type": "Earnings Call Transcript",
         "published_date": "2026-10-01",
         "locator": "mock://guidance",
-        "content": "MOCK / FIXTURE DATA. Planet Labs PBC management expects Data revenue to grow 30% in FY27 Q2.",
+        "content": "MOCK / FIXTURE DATA.\n\nPlanet Labs PBC management expects Data revenue to grow 30% in FY27 Q2.",
         "tags": ["mock", "fixture"],
     }
     rules = (ROOT / "prompts" / "research_agent.md").read_text(encoding="utf-8")
@@ -79,7 +81,7 @@ def payload():
             "period": "FY27 Q2",
             "scope": "Data + Analytics",
             "evidence_type": "Management Guidance",
-            "source_locator": "paragraph 1",
+            "source_locator": "B002",
         }],
         "variables": [{
             "name": "Data revenue growth",
@@ -96,6 +98,65 @@ def payload():
     }
 
 
+@pytest.mark.parametrize(("content", "expected"), [
+    ("paragraph one\n\nparagraph two", {"B001": "paragraph one", "B002": "paragraph two"}),
+    (
+        "\r\n  paragraph one\r\n  indented  \r\nend \r\n \t\r\n\r\n paragraph two \r\n",
+        {"B001": "paragraph one\r\n  indented  \r\nend", "B002": "paragraph two"},
+    ),
+])
+def test_locatable_blocks_are_deterministic_and_preserve_text(content, expected):
+    first = build_locatable_content(content)
+    assert first == expected
+    assert list(first) == ["B001", "B002"]
+    assert build_locatable_content(content) == first
+
+
+@pytest.mark.parametrize(("variants", "expected"), [
+    (("Revenue", "revenue", "Segment Revenue", "segment_revenue", " \tSEGMENT--__REVENUE \n"), "revenue"),
+    ((
+        "Growth Rate", "Growth rate", "growth_rate",
+        "Revenue Growth Rate", "revenue_growth_rate",
+        "Segment Revenue Growth Rate", "segment_revenue_growth_rate",
+    ), "growth_rate"),
+    (("Revenue Mix", "revenue_mix", "Revenue Share", "Revenue Contribution"), "revenue_mix"),
+    (("Customer Count", "  CUSTOMER---__ COUNT  "), "customer_count"),
+])
+def test_variable_type_normalization(payload, variants, expected):
+    candidate = VariableCandidate.model_validate_json(json.dumps(payload["variables"][0]))
+    for variable_type in variants:
+        normalized = normalize_variable_candidate(candidate.model_copy(update={"variable_type": variable_type}))
+        assert normalized.variable_type == expected
+
+
+@pytest.mark.parametrize(("scope", "unit", "expected_scope", "expected_unit"), [
+    ("  Total \n company  revenue  ", "  %  of\t total revenue  ", "Total company revenue", "% of total revenue"),
+    (None, None, None, None),
+])
+def test_variable_cleanup_preserves_lineage(scope, unit, expected_scope, expected_unit):
+    candidate = VariableCandidate(
+        name="  Reported \n revenue   (FY27 Q2)  ",
+        definition="  Source-defined metric  ",
+        variable_type="Revenue Share",
+        value=30.0,
+        period=" FY27 Q2 ",
+        input_type=CandidateInputType.GUIDANCE,
+        entity_name=" Planet Labs PBC ",
+        evidence_indexes=[2, 0],
+        scope=scope,
+        unit=unit,
+    )
+    original = candidate.model_dump()
+    normalized = normalize_variable_candidate(candidate)
+    assert normalized.name == "Reported revenue (FY27 Q2)"
+    assert normalized.scope == expected_scope
+    assert normalized.unit == expected_unit
+    assert normalized.variable_type == "revenue_mix"
+    changed_fields = {"name", "scope", "unit", "variable_type"}
+    assert normalized.model_dump(exclude=changed_fields) == candidate.model_dump(exclude=changed_fields)
+    assert candidate.model_dump() == original
+
+
 def test_valid_responses_candidates_and_prompt_composition(inputs, payload):
     client = FakeClient(json.dumps(payload))
     result = DeepSeekExtractionBackend(client=client).extract(*inputs)
@@ -107,7 +168,9 @@ def test_valid_responses_candidates_and_prompt_composition(inputs, payload):
     assert result.entities[0].ticker is None
     assert result.evidence[0].statement in inputs[1]["content"]
     assert result.evidence[0].evidence_type == "Management Guidance"
+    assert result.evidence[0].source_locator == "B002"
     assert result.variables[0].value == 30
+    assert result.variables[0].variable_type == "financial"
     assert result.variables[0].input_type is CandidateInputType.GUIDANCE
     assert result.variables[0].evidence_indexes == [0]
     assert len(client.calls) == 1
@@ -126,11 +189,32 @@ def test_valid_responses_candidates_and_prompt_composition(inputs, payload):
     assert system["role"] == "system" and inputs[2] in system["content"]
     assert "Do not use outside knowledge" in system["content"]
     assert "EXTRACTION COMPLETENESS RULES" in system["content"]
+    assert "EVIDENCE LOCATOR RULES" in system["content"]
     assert "Do not suppress one variable because it can be mathematically derived from another." in system["content"]
     assert "CANDIDATE JSON SCHEMA" in system["content"] and "EXAMPLE JSON OUTPUT" in system["content"]
     sent = json.loads(user["content"])
     assert sent["research_task"] == inputs[0].model_dump(mode="json")
-    assert sent["raw_source_material"] == {key: value for key, value in inputs[1].items() if key != "tags"}
+    expected_material = {key: value for key, value in inputs[1].items() if key != "tags"}
+    expected_material["content"] = (
+        "SOURCE CONTENT WITH LOCATORS\n\n[B001]\nMOCK / FIXTURE DATA.\n\n[B002]\n"
+        "Planet Labs PBC management expects Data revenue to grow 30% in FY27 Q2."
+    )
+    assert sent["raw_source_material"] == expected_material
+
+
+@pytest.mark.parametrize("locator", ["B999", "mock://guidance"], ids=["invented-block", "source-level-uri"])
+def test_invalid_evidence_locator_rejected(inputs, payload, locator, monkeypatch):
+    def forbidden_normalization(candidate):
+        raise AssertionError("Locator validation must finish before variable normalization")
+
+    monkeypatch.setattr(extractor_module, "normalize_variable_candidate", forbidden_normalization)
+    invalid_evidence = deepcopy(payload["evidence"][0])
+    invalid_evidence["source_locator"] = locator
+    payload["evidence"].append(invalid_evidence)
+    client = FakeClient(json.dumps(payload))
+    with pytest.raises(ExtractionValidationError, match="Evidence candidate 1 has invalid source_locator"):
+        DeepSeekExtractionBackend(client=client).extract(*inputs)
+    assert len(client.calls) == 1
 
 
 @pytest.mark.parametrize("input_type", ["MODEL ESTIMATE", "Derived"])

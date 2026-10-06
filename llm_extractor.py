@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 import json
 import os
+import re
 from typing import Annotated
 
 from openai import OpenAI
@@ -157,9 +158,53 @@ could be calculated from other reported metrics. Do not label it Derived or omit
 Keep management expectations and forecasts as Guidance, and explicitly attributed third-party
 estimates as Third-party Estimate. Completeness never permits inventing or calculating facts.
 
+EVIDENCE LOCATOR RULES
+The material's top-level locator identifies the entire Source, not a location inside it.
+1. Every EvidenceCandidate must reference the smallest supplied source block that directly
+   supports its statement.
+2. source_locator must be exactly one bare block ID supplied in SOURCE CONTENT WITH LOCATORS,
+   such as B002. Do not include brackets, ranges, multiple IDs, or descriptive text.
+3. Never invent a locator.
+4. Do not use the source-level URL, URI, file path, or document locator as source_locator.
+5. If one block directly contains the complete fact, cite only that block.
+6. Evidence must remain atomic. Do not use a wider locator to combine unrelated facts.
+
 Return one JSON object conforming to the schema, without markdown fences or surrounding prose.
 The empty JSON example shows the output shape only; extract actual supported facts when present.
 """
+
+
+def build_locatable_content(content: str) -> dict[str, str]:
+    """Map sequential block IDs to paragraph text, preserving internal whitespace.
+
+    Blank lines, including whitespace-only lines, separate blocks. Only each
+    block's outer whitespace is trimmed; LF and CRLF inside a block are kept.
+    """
+    paragraphs = [block.strip() for block in re.split(r"\r?\n[^\S\r\n]*\r?\n", content) if block.strip()]
+    return {f"B{index:03d}": block for index, block in enumerate(paragraphs, start=1)}
+
+
+def normalize_variable_candidate(candidate: VariableCandidate) -> VariableCandidate:
+    """Normalize a validated candidate's limited synonyms and display whitespace.
+
+    Return a copy without changing facts, classification, or evidence lineage.
+    Unknown variable types receive formatting only; no fuzzy matching is used.
+    """
+    variable_type = re.sub(r"[\s-]+", "_", candidate.variable_type.strip().lower())
+    variable_type = re.sub(r"_+", "_", variable_type)
+    synonyms = {
+        "segment_revenue": "revenue",
+        "revenue_growth_rate": "growth_rate",
+        "segment_revenue_growth_rate": "growth_rate",
+        "revenue_share": "revenue_mix",
+        "revenue_contribution": "revenue_mix",
+    }
+    return candidate.model_copy(update={
+        "variable_type": synonyms.get(variable_type, variable_type),
+        "name": " ".join(candidate.name.split()),
+        "scope": " ".join(candidate.scope.split()) if candidate.scope is not None else None,
+        "unit": " ".join(candidate.unit.split()) if candidate.unit is not None else None,
+    })
 
 
 def _messages(task: ResearchTask, material: dict, operating_rules: str) -> list[dict[str, str]]:
@@ -180,6 +225,11 @@ def _messages(task: ResearchTask, material: dict, operating_rules: str) -> list[
         if not isinstance(value, str) or not value.strip():
             raise ExtractionValidationError(f"material.{field} must be a non-blank string")
 
+    blocks = build_locatable_content(material["content"])
+    source_material = {field: material[field] for field in _MATERIAL_FIELDS}
+    source_material["content"] = "SOURCE CONTENT WITH LOCATORS\n\n" + "\n\n".join(
+        f"[{block_id}]\n{text}" for block_id, text in blocks.items()
+    )
     schema = json.dumps(ExtractionResult.model_json_schema(), ensure_ascii=False)
     example = ExtractionResult().model_dump_json()
     return [
@@ -191,7 +241,7 @@ def _messages(task: ResearchTask, material: dict, operating_rules: str) -> list[
             "role": "user",
             "content": json.dumps({
                 "research_task": task.model_dump(mode="json"),
-                "raw_source_material": {field: material[field] for field in _MATERIAL_FIELDS},
+                "raw_source_material": source_material,
             }, ensure_ascii=False, allow_nan=False),
         },
     ]
@@ -220,6 +270,8 @@ class DeepSeekExtractionBackend(ExtractionBackend):
 
     def extract(self, task: ResearchTask, material: dict, operating_rules: str) -> ExtractionResult:
         messages = _messages(task, material, operating_rules)
+        # Use the same deterministic splitter as the prompt, before the request.
+        block_ids = set(build_locatable_content(material["content"]))
         try:
             response = self.client.responses.create(
                 model=self.model,
@@ -255,6 +307,14 @@ class DeepSeekExtractionBackend(ExtractionBackend):
         if not isinstance(content, str) or not content.strip():
             raise ExtractionValidationError("DeepSeek returned empty extraction content")
         try:
-            return ExtractionResult.model_validate_json(content)
+            result = ExtractionResult.model_validate_json(content)
         except ValidationError as exc:
             raise ExtractionValidationError("DeepSeek extraction is not valid JSON conforming to ExtractionResult") from exc
+        for index, evidence in enumerate(result.evidence):
+            if evidence.source_locator not in block_ids:
+                raise ExtractionValidationError(
+                    f"Evidence candidate {index} has invalid source_locator {evidence.source_locator!r}; "
+                    "expected one supplied source block ID"
+                )
+        result.variables = [normalize_variable_candidate(candidate) for candidate in result.variables]
+        return result
