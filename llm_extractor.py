@@ -123,6 +123,40 @@ This backend performs no search; leave not_found.search_attempted empty.
 Apply the supplied operating rules' source-faithfulness and role boundaries. Their mock execution,
 storage workflow, and full ResearchResult layout describe the complete Agent, not this extraction
 stage. This stage uses the candidate JSON schema below instead. Do not perform search or persistence.
+
+EXTRACTION COMPLETENESS RULES
+Apply these rules to facts relevant to the supplied ResearchTask, respecting its period and scope.
+1. Extract every distinct factual statement directly stated in the supplied source that is
+   relevant to the ResearchTask. Do not stop after extracting the primary metric.
+2. Split compound sentences into separate EvidenceCandidates for independently usable facts.
+   Each EvidenceCandidate must describe one atomic fact with its source-stated context.
+   A sentence reporting total revenue and year-over-year growth produces separate evidence
+   for the revenue amount and the growth rate. A sentence reporting segment revenue, its
+   growth rate, and its share of total revenue produces separate evidence for each metric.
+3. Every explicitly reported relevant quantitative fact must produce an EvidenceCandidate.
+4. Every explicitly reported relevant quantitative fact that represents a research variable
+   must also produce a VariableCandidate linked to its corresponding atomic evidence.
+5. Do not omit a quantitative fact merely because another related metric was extracted.
+6. Do not calculate new values. Only extract values explicitly stated in the source.
+7. Narrative statements explicitly made by the source may be EvidenceCandidates, but must
+   not be converted into model inference or Claim. Preserve attribution and qualifiers.
+8. Before returning, review the source once more. Verify that every relevant explicit numeric
+   fact was extracted and that every directly stated relevant narrative fact was considered.
+
+VARIABLE COMPLETENESS
+For every directly stated relevant numeric fact, ask:
+"Does this fact represent an observable research variable?"
+If yes, create a VariableCandidate and reference its supporting EvidenceCandidate.
+Examples include revenue, growth rate, segment revenue, revenue mix, margin, customer count,
+backlog, capacity, volume, price, and guidance.
+Do not suppress one variable because it can be mathematically derived from another.
+Source-reported total revenue, segment revenue, revenue share, and other-business revenue
+are independent facts and must each be extracted when explicitly stated and relevant.
+If the source explicitly reports an observed metric, it is still Observed even when its value
+could be calculated from other reported metrics. Do not label it Derived or omit it.
+Keep management expectations and forecasts as Guidance, and explicitly attributed third-party
+estimates as Third-party Estimate. Completeness never permits inventing or calculating facts.
+
 Return one JSON object conforming to the schema, without markdown fences or surrounding prose.
 The empty JSON example shows the output shape only; extract actual supported facts when present.
 """
@@ -164,7 +198,7 @@ def _messages(task: ResearchTask, material: dict, operating_rules: str) -> list[
 
 
 class DeepSeekExtractionBackend(ExtractionBackend):
-    """Synchronous JSON-mode extraction with an optional injected SDK client.
+    """Synchronous Responses JSON Schema extraction with an injected SDK option.
 
     Only creating a non-injected client requires DEEPSEEK_API_KEY. SDK retries
     are disabled. No extraction call is made by constructing the backend.
@@ -187,27 +221,37 @@ class DeepSeekExtractionBackend(ExtractionBackend):
     def extract(self, task: ResearchTask, material: dict, operating_rules: str) -> ExtractionResult:
         messages = _messages(task, material, operating_rules)
         try:
-            response = self.client.chat.completions.create(
+            response = self.client.responses.create(
                 model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                max_tokens=4096,
+                input=messages,
+                text={"format": {
+                    "type": "json_schema",
+                    "name": "research_extraction",
+                    "schema": ExtractionResult.model_json_schema(),
+                }},
+                max_output_tokens=4096,
+                temperature=0,
                 stream=False,
             )
         except Exception as exc:
             # Keep provider response bodies and configuration out of error text.
             raise LLMProviderError("DeepSeek API request failed") from exc
 
-        choices = getattr(response, "choices", None)
-        if not choices:
-            raise ExtractionValidationError("DeepSeek returned an empty response")
-        choice = choices[0]
-        if getattr(choice, "finish_reason", None) == "length":
-            raise ExtractionValidationError("DeepSeek extraction response was truncated")
-        message = getattr(choice, "message", None)
-        if getattr(message, "refusal", None):
-            raise LLMProviderError("DeepSeek refused the extraction request")
-        content = getattr(message, "content", None)
+        status = getattr(response, "status", None)
+        if status == "failed" or getattr(response, "error", None):
+            raise LLMProviderError("DeepSeek response failed")
+        if status == "incomplete":
+            details = getattr(response, "incomplete_details", None)
+            if getattr(details, "reason", None) == "content_filter":
+                raise LLMProviderError("DeepSeek refused the extraction request")
+            raise ExtractionValidationError("DeepSeek extraction response was truncated or incomplete")
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", None) == "message" and any(
+                getattr(part, "type", None) == "refusal"
+                for part in getattr(item, "content", None) or []
+            ):
+                raise LLMProviderError("DeepSeek refused the extraction request")
+        content = getattr(response, "output_text", None)
         if not isinstance(content, str) or not content.strip():
             raise ExtractionValidationError("DeepSeek returned empty extraction content")
         try:

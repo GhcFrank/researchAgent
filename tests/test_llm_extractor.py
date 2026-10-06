@@ -26,13 +26,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeClient:
-    def __init__(self, content=None, error=None, finish_reason="stop"):
+    def __init__(self, output_text=None, error=None, status="completed"):
         self.calls = []
         self.error = error
-        self.response = SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(content=content), finish_reason=finish_reason,
-        )])
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+        self.response = SimpleNamespace(output_text=output_text, status=status)
+        self.responses = SimpleNamespace(create=self.create)
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -98,7 +96,7 @@ def payload():
     }
 
 
-def test_valid_json_candidates_and_prompt_composition(inputs, payload):
+def test_valid_responses_candidates_and_prompt_composition(inputs, payload):
     client = FakeClient(json.dumps(payload))
     result = DeepSeekExtractionBackend(client=client).extract(*inputs)
     assert isinstance(result, ExtractionResult)
@@ -115,11 +113,20 @@ def test_valid_json_candidates_and_prompt_composition(inputs, payload):
     assert len(client.calls) == 1
     request = client.calls[0]
     assert request["model"] == "deepseek-flash"
-    assert request["response_format"] == {"type": "json_object"}
+    assert request["text"] == {"format": {
+        "type": "json_schema",
+        "name": "research_extraction",
+        "schema": ExtractionResult.model_json_schema(),
+    }}
+    assert "response_format" not in request and "messages" not in request
+    assert request["max_output_tokens"] == 4096
+    assert request["temperature"] == 0
     assert request["stream"] is False
-    system, user = request["messages"]
+    system, user = request["input"]
     assert system["role"] == "system" and inputs[2] in system["content"]
     assert "Do not use outside knowledge" in system["content"]
+    assert "EXTRACTION COMPLETENESS RULES" in system["content"]
+    assert "Do not suppress one variable because it can be mathematically derived from another." in system["content"]
     assert "CANDIDATE JSON SCHEMA" in system["content"] and "EXAMPLE JSON OUTPUT" in system["content"]
     sent = json.loads(user["content"])
     assert sent["research_task"] == inputs[0].model_dump(mode="json")
@@ -167,21 +174,22 @@ def test_invalid_json_is_not_repaired(inputs, payload, fenced):
         DeepSeekExtractionBackend(client=FakeClient(content)).extract(*inputs)
 
 
-@pytest.mark.parametrize("content", [None, " \n\t"])
+@pytest.mark.parametrize("content", [None, "", " \n\t"])
 def test_empty_response_raises(inputs, content):
     with pytest.raises(ExtractionValidationError, match="empty"):
         DeepSeekExtractionBackend(client=FakeClient(content)).extract(*inputs)
 
 
-def test_no_choices_raises(inputs):
+def test_missing_output_text_raises(inputs):
     client = FakeClient()
-    client.response.choices = []
-    with pytest.raises(ExtractionValidationError, match="empty response"):
+    del client.response.output_text
+    with pytest.raises(ExtractionValidationError, match="empty"):
         DeepSeekExtractionBackend(client=client).extract(*inputs)
 
 
 def test_truncated_response_rejected_even_if_json_is_valid(inputs, payload):
-    client = FakeClient(json.dumps(payload), finish_reason="length")
+    client = FakeClient(json.dumps(payload), status="incomplete")
+    client.response.incomplete_details = SimpleNamespace(reason="max_output_tokens")
     with pytest.raises(ExtractionValidationError, match="truncated"):
         DeepSeekExtractionBackend(client=client).extract(*inputs)
 
@@ -193,6 +201,26 @@ def test_provider_failure_wrapped_once(inputs):
         DeepSeekExtractionBackend(client=client).extract(*inputs)
     assert exc.value.__cause__ is failure
     assert len(client.calls) == 1
+
+
+def test_failed_response_raises_provider_error(inputs, payload):
+    client = FakeClient(json.dumps(payload), status="failed")
+    with pytest.raises(LLMProviderError, match="response failed"):
+        DeepSeekExtractionBackend(client=client).extract(*inputs)
+
+
+@pytest.mark.parametrize("refusal", ["content-filter", "refusal-part"])
+def test_refused_response_raises_provider_error(inputs, refusal):
+    client = FakeClient()
+    if refusal == "content-filter":
+        client.response.status = "incomplete"
+        client.response.incomplete_details = SimpleNamespace(reason="content_filter")
+    else:
+        client.response.output = [SimpleNamespace(
+            type="message", content=[SimpleNamespace(type="refusal")],
+        )]
+    with pytest.raises(LLMProviderError, match="refused"):
+        DeepSeekExtractionBackend(client=client).extract(*inputs)
 
 
 def test_environment_config_constructs_only_fake_client(monkeypatch):
