@@ -22,7 +22,7 @@ from llm_extractor import (
     normalize_variable_candidate,
 )
 from schemas import ResearchTask
-from source_segmentation import build_source_blocks, render_blocks
+from source_segmentation import SourceBlock, build_source_blocks, render_blocks
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -187,21 +187,12 @@ def test_valid_responses_candidates_and_prompt_composition(inputs, payload):
         "schema": ExtractionResult.model_json_schema(),
     }}
     assert "response_format" not in request and "messages" not in request
-    assert request["max_output_tokens"] == 4096
+    assert request["max_output_tokens"] == 32768
     assert request["temperature"] == 0
     assert request["stream"] is False
     system, user = request["input"]
-    assert system["role"] == "system" and inputs[2] in system["content"]
-    assert "Do not use outside knowledge" in system["content"]
-    assert "EXTRACTION COMPLETENESS RULES" in system["content"]
-    assert "ATOMIC EVIDENCE RULE" in system["content"]
-    assert "Use predicate structure, not punctuation alone, to decide whether to split." in system["content"]
-    assert "Multiple independent predicates must be split into separate EvidenceCandidates" in system["content"]
-    assert "One predicate with multiple objects must remain one EvidenceCandidate." in system["content"]
-    assert '"Can part A be true or false independently of part B?"' in system["content"]
-    assert "EVIDENCE LOCATOR RULES" in system["content"]
-    assert "Do not suppress one variable because it can be mathematically derived from another." in system["content"]
-    assert "CANDIDATE JSON SCHEMA" in system["content"] and "EXAMPLE JSON OUTPUT" in system["content"]
+    assert system == {"role": "system", "content": extractor_module._EXTRACTION_INSTRUCTIONS}
+    assert "Apply relevance before completeness." in system["content"]
     sent = json.loads(user["content"])
     assert sent["research_task"] == inputs[0].model_dump(mode="json")
     expected_material = {key: value for key, value in inputs[1].items() if key != "tags"}
@@ -210,6 +201,69 @@ def test_valid_responses_candidates_and_prompt_composition(inputs, payload):
         "Planet Labs PBC management expects Data revenue to grow 30% in FY27 Q2."
     )
     assert sent["raw_source_material"] == expected_material
+
+
+def test_explicit_output_budget_sent_to_provider(inputs, payload):
+    client = FakeClient(json.dumps(payload))
+    result = DeepSeekExtractionBackend(client=client, max_output_tokens=8192).extract(*inputs)
+    assert isinstance(result, ExtractionResult)
+    assert len(client.calls) == 1
+    assert client.calls[0]["max_output_tokens"] == 8192
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 8192.0])
+def test_invalid_output_budget_rejected_before_request(budget):
+    client = FakeClient()
+    with pytest.raises(ExtractionValidationError, match="positive integer"):
+        DeepSeekExtractionBackend(client=client, max_output_tokens=budget)
+    assert client.calls == []
+
+
+def test_supplied_block_ids_and_source_metadata_preserved(inputs, payload, monkeypatch):
+    task, material, rules = inputs
+    blocks = [
+        SourceBlock("B105", "Earlier selected paragraph with  original  spacing."),
+        SourceBlock("B220", payload["evidence"][0]["statement"]),
+    ]
+    before = (deepcopy(material), deepcopy(blocks))
+
+    def forbidden_segmentation(content):
+        raise AssertionError("Supplied blocks must not be re-segmented")
+
+    monkeypatch.setattr(extractor_module, "build_source_blocks", forbidden_segmentation)
+    payload["evidence"][0]["source_locator"] = "B220"
+    client = FakeClient(json.dumps(payload))
+    result = DeepSeekExtractionBackend(client=client).extract(task, material, rules, source_blocks=blocks)
+    assert result.evidence[0].source_locator == "B220"
+    assert len(client.calls) == 1
+    sent = json.loads(client.calls[0]["input"][1]["content"])["raw_source_material"]
+    assert sent["content"] == "SOURCE CONTENT WITH LOCATORS\n\n" + render_blocks(blocks)
+    assert "[B001]" not in sent["content"] and "[B002]" not in sent["content"]
+    assert {key: value for key, value in sent.items() if key != "content"} == {
+        key: material[key] for key in sent if key != "content"
+    }
+    assert (material, blocks) == before
+
+
+@pytest.mark.parametrize("locator", ["B999", "B001"])
+def test_locator_outside_supplied_blocks_rejected(inputs, payload, locator):
+    payload["evidence"][0]["source_locator"] = locator
+    blocks = [SourceBlock("B105", "Earlier paragraph."), SourceBlock("B220", "Selected paragraph.")]
+    client = FakeClient(json.dumps(payload))
+    with pytest.raises(ExtractionValidationError, match="invalid source_locator"):
+        DeepSeekExtractionBackend(client=client).extract(*inputs, source_blocks=blocks)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("blocks", [
+    [],
+    [SourceBlock("B105", "First paragraph."), SourceBlock("B105", "Second paragraph.")],
+], ids=["empty", "duplicate-ids"])
+def test_invalid_supplied_blocks_rejected_before_request(inputs, blocks):
+    client = FakeClient()
+    with pytest.raises(ExtractionValidationError):
+        DeepSeekExtractionBackend(client=client).extract(*inputs, source_blocks=blocks)
+    assert client.calls == []
 
 
 @pytest.mark.parametrize("locator", ["B999", "mock://guidance"], ids=["invented-block", "source-level-uri"])
