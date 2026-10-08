@@ -31,6 +31,7 @@ from schemas import (
     Variable,
     VariableInputType,
 )
+from source_segmentation import build_source_blocks, chunk_source_blocks
 from storage import ResearchStorage
 
 
@@ -62,9 +63,13 @@ class FakeExtractionBackend(ExtractionBackend):
         self.outcomes = outcomes or {}
         self.calls = []
 
-    def extract(self, task, material, operating_rules):
-        self.calls.append({"task": task, "material": deepcopy(material), "operating_rules": operating_rules})
-        outcome = self.outcomes.get(material["source_ref"], self.result)
+    def extract(self, task, material, operating_rules, *, source_blocks=None):
+        self.calls.append({
+            "task": task, "material": deepcopy(material), "operating_rules": operating_rules,
+            "source_blocks": source_blocks,
+        })
+        chunk_key = (material["source_ref"], source_blocks[0].block_id) if source_blocks else None
+        outcome = self.outcomes.get(chunk_key, self.outcomes.get(material["source_ref"], self.result))
         if isinstance(outcome, ExtractionError):
             raise outcome
         return outcome.model_copy(deep=True)
@@ -372,8 +377,7 @@ def test_backend_conversion_metadata_lineage_and_rerun(task, storage, tmp_path, 
     insert = storage.insert
 
     def record_insert(obj):
-        assert len(backend.calls) == 2  # Both extractions finish before any Research Object is persisted.
-        writes.append(type(obj))
+        writes.append((len(backend.calls), type(obj)))
         return insert(obj)
 
     monkeypatch.setattr(storage, "insert", record_insert)
@@ -383,6 +387,7 @@ def test_backend_conversion_metadata_lineage_and_rerun(task, storage, tmp_path, 
         assert call["task"] == task
         assert call["material"] == raw
         assert call["operating_rules"] == PROMPT.read_text(encoding="utf-8")
+        assert call["source_blocks"] == tuple(build_source_blocks(raw["content"]))
     assert len(tool.queries) == 1
     assert len(result.entities_created) == 1
     assert len(result.sources_created) == 2
@@ -391,7 +396,11 @@ def test_backend_conversion_metadata_lineage_and_rerun(task, storage, tmp_path, 
     entity = result.entities_created[0]
     assert (entity.canonical_name, entity.ticker, entity.geography) == ("Planet Labs PBC", "PL", "Global")
     ranks = {Entity: 0, Source: 1, Evidence: 2, Variable: 3}
-    assert [ranks[kind] for kind in writes] == sorted(ranks[kind] for kind in writes)
+    assert [call_number for call_number, _ in writes] == sorted(call_number for call_number, _ in writes)
+    assert {call_number for call_number, _ in writes} == {1, 2}
+    for call_number in (1, 2):
+        batch_ranks = [ranks[kind] for number, kind in writes if number == call_number]
+        assert batch_ranks == sorted(batch_ranks)
     for source, raw in zip(result.sources_created, records):
         for field in ("title", "publisher", "source_type", "published_date", "locator"):
             assert getattr(source, field) == raw[field]
@@ -416,12 +425,18 @@ def test_backend_conversion_metadata_lineage_and_rerun(task, storage, tmp_path, 
         assert item.model_dump(exclude={"variable_id", "entity_id", "evidence_ids", "last_updated", "input_type"}) == candidate.model_dump(exclude={"entity_name", "evidence_indexes", "input_type"})
     assert result.search_coverage.primary_source_found
     assert result.search_coverage.period_covered and result.search_coverage.scope_covered
-    assert result.potential_conflicts == backend_result.potential_conflicts * 2
+    assert result.potential_conflicts == backend_result.potential_conflicts
     assert all(not item.evidence_ids for item in result.potential_conflicts)
-    assert all(item.search_attempted == tool.queries for item in result.not_found)
-    assert result.candidate_gaps == backend_result.candidate_gaps * 2
-    assert result.follow_up_candidates == backend_result.follow_up_candidates * 2
-    assert result.research_notes == "\n\n".join([backend_result.research_notes] * 2)
+    assert all(item.search_attempted[:len(tool.queries)] == tool.queries for item in result.not_found)
+    assert len(result.not_found) == 1
+    assert result.not_found[0].search_attempted[len(tool.queries):] == [
+        f"{record['source_ref']}#C001" for record in records
+    ]
+    assert "Chunk-local" in result.not_found[0].result
+    assert result.candidate_gaps == backend_result.candidate_gaps
+    assert result.follow_up_candidates == backend_result.follow_up_candidates
+    assert backend_result.research_notes in result.research_notes
+    assert result.research_notes.count(backend_result.research_notes) == 1
     for kind in (Claim, Gap, Estimate, Event):
         assert storage.list_objects(kind) == []
     assert ResearchStorage(storage.data_dir).list_objects(Variable) == result.variables_created
@@ -457,7 +472,7 @@ def test_distinct_observations_are_not_consolidated(task, storage, tmp_path, mat
     assert [getattr(item, field) for item in variables] == [getattr(backend_result.variables[0], field), different]
     assert all(len(item.evidence_ids) == 1 for item in variables)
     assert len({storage.get_by_id(Evidence, item.evidence_ids[0]).source_id for item in variables}) == 2
-    assert result.potential_conflicts == backend_result.potential_conflicts * 2
+    assert result.potential_conflicts == backend_result.potential_conflicts
 
 
 def test_existing_observation_updates_lineage_once_and_keeps_id(task, storage, tmp_path, materials, backend_result, monkeypatch):
@@ -524,9 +539,8 @@ def test_backend_reuses_existing_entity_and_source(task, storage, tmp_path, mate
     assert storage.list_objects(Source) == [source]
 
 
-def test_backend_later_extraction_failure_keeps_storage_unchanged(task, storage, tmp_path, materials, backend_result):
-    storage.insert(Entity(entity_id="preexisting", entity_type="company", canonical_name="Existing company"))
-    before = {path.name: path.read_bytes() for path in storage.data_dir.iterdir()}
+def test_backend_later_extraction_failure_preserves_prior_source_objects(task, storage, tmp_path, materials, backend_result):
+    existing = storage.insert(Entity(entity_id="preexisting", entity_type="company", canonical_name="Existing company"))
     failure = ExtractionValidationError("simulated extraction failure")
     backend = FakeExtractionBackend(backend_result, {materials[1]["source_ref"]: failure})
     agent = ResearchAgent(fixture_tool(tmp_path, materials[:2]), storage, PROMPT, extraction_backend=backend)
@@ -534,7 +548,12 @@ def test_backend_later_extraction_failure_keeps_storage_unchanged(task, storage,
         agent.run(task)
     assert exc.value.__cause__ is failure
     assert len(backend.calls) == 2
-    assert {path.name: path.read_bytes() for path in storage.data_dir.iterdir()} == before
+    assert storage.get_by_id(Entity, existing.entity_id) == existing
+    assert len(storage.list_objects(Entity)) == 2
+    sources = storage.list_objects(Source)
+    assert len(sources) == 1 and sources[0].locator == materials[0]["locator"]
+    assert len(storage.list_objects(Evidence)) == len(storage.list_objects(Variable)) == 2
+    assert all(item.source_id == sources[0].source_id for item in storage.list_objects(Evidence))
 
 
 @pytest.mark.parametrize(("failure", "message"), [
@@ -657,7 +676,7 @@ def test_source_store_stays_empty_when_no_material_is_read(
 
 
 @pytest.mark.parametrize("path", ["backend-extraction", "deterministic-validation"])
-def test_extraction_failure_retains_read_snapshots_without_persisting_objects(
+def test_extraction_failure_retains_snapshots_and_prior_successful_objects(
     task, workspace_storage, source_store, tmp_path, materials, backend_result, monkeypatch, path,
 ):
     tool = fixture_tool(tmp_path, materials[:2])
@@ -679,7 +698,13 @@ def test_extraction_failure_retains_read_snapshots_without_persisting_objects(
     assert tool.read_refs == [material["source_ref"] for material in materials[:2]]
     for material in materials[:2]:
         assert source_store.get(material["source_ref"])["content"] == material["content"]
-    assert_storage_empty(workspace_storage)
+    if backend is not None:
+        assert len(workspace_storage.list_objects(Source)) == 1
+        assert len(workspace_storage.list_objects(Entity)) == 1
+        assert len(workspace_storage.list_objects(Evidence)) == 2
+        assert len(workspace_storage.list_objects(Variable)) == 2
+    else:
+        assert_storage_empty(workspace_storage)
 
 
 @pytest.mark.parametrize("path", ["deterministic", "backend"])
@@ -744,6 +769,183 @@ def test_read_failure_preserves_error_and_only_saves_successful_reads(
     assert not source_store.contains("mock-src-002") and not source_store.contains("mock-src-004")
     assert not backend.calls
     assert_storage_empty(workspace_storage)
+
+
+def long_source_and_chunk_results(task, materials, backend_result, values=(60, 65, 60)):
+    """Five real chunks: three lexical matches and two unrelated paragraphs."""
+    material = deepcopy(materials[0])
+    paragraphs = []
+    for index in range(1, 6):
+        if index in (1, 3, 5):
+            value = values[(index - 1) // 2]
+            prefix = f"FY27 Q2: Data + Analytics revenue was USD {value} million. "
+        else:
+            prefix = "Unrelated archival observations. "
+        paragraphs.append(prefix + "neutral filler " * 330)
+    material.update(
+        source_ref="mock-long-filing", source_type="10-Q", locator="mock://long-filing",
+        content="\n\n".join(paragraphs), raw_content="<html>synthetic filing</html>",
+        tags=[agent_module._build_query(task)], primary_or_secondary="Primary",
+        independence_group="filing-disclosure-group",
+    )
+    blocks = build_source_blocks(material["content"])
+    chunks = chunk_source_blocks(blocks)
+    assert [chunk.chunk_id for chunk in chunks] == [f"C{index:03d}" for index in range(1, 6)]
+    outcomes = {}
+    for index, value in zip((1, 3, 5), values):
+        extracted = backend_result.model_copy(deep=True)
+        evidence = extracted.evidence[1].model_copy(deep=True)
+        evidence.source_locator = f"B{index:03d}"
+        evidence.value = value
+        evidence.statement = f"Data + Analytics revenue was USD {value} million."
+        variable = extracted.variables[1].model_copy(deep=True)
+        variable.value = value
+        variable.name = f"Business revenue described in block {index}"
+        variable.evidence_indexes = [0]
+        extracted.evidence = [evidence]
+        extracted.variables = [variable]
+        outcomes[(material["source_ref"], evidence.source_locator)] = extracted
+    return material, chunks, outcomes
+
+
+def test_stage1_lexical_selection_chunk_local_lineage_incremental_persistence_and_rerun(
+    task, workspace_storage, source_store, tmp_path, materials, backend_result, monkeypatch,
+):
+    material, chunks, outcomes = long_source_and_chunk_results(task, materials, backend_result)
+    tool = fixture_tool(tmp_path, [material, deepcopy(materials[1])])
+    backend = FakeExtractionBackend(backend_result, outcomes)
+    agent = ResearchAgent(
+        tool, workspace_storage, PROMPT, extraction_backend=backend, source_store=source_store,
+        search_query="PL", source_refs=[material["source_ref"]],
+    )
+    retrieve = agent_module.retrieve_candidate_chunks
+    retrieval_calls = []
+
+    def record_retrieval(supplied_chunks, **kwargs):
+        assert supplied_chunks == chunks
+        assert kwargs["top_k"] == 8 and kwargs["neighbor_radius"] == 0
+        assert set(kwargs["terms"]) == set(agent_module._build_query(task).split())
+        assert list(kwargs["phrases"]) == [task.scope.product_or_business]
+        selected = retrieve(supplied_chunks, **kwargs)
+        retrieval_calls.append([item.chunk_id for item in selected])
+        return selected
+
+    monkeypatch.setattr(agent_module, "retrieve_candidate_chunks", record_retrieval)
+    extract = backend.extract
+
+    def check_incremental_extract(**kwargs):
+        call_number = len(backend.calls)
+        assert source_store.get(material["source_ref"])["content"] == material["content"]
+        assert len(workspace_storage.list_objects(Evidence)) == call_number
+        if call_number:
+            assert len(workspace_storage.list_objects(Entity)) == 1
+            assert len(workspace_storage.list_objects(Source)) == 1
+            assert len(workspace_storage.list_objects(Variable)) == call_number
+        return extract(**kwargs)
+
+    monkeypatch.setattr(backend, "extract", check_incremental_extract)
+    result = agent.run(task)
+    assert tool.queries == ["PL"] and tool.read_refs == [material["source_ref"]]
+    assert retrieval_calls == [["C001", "C003", "C005"]]
+    assert [tuple(block.block_id for block in call["source_blocks"]) for call in backend.calls] == [
+        ("B001",), ("B003",), ("B005",),
+    ]
+    assert all(len(call["source_blocks"][0].text) < len(material["content"]) for call in backend.calls)
+    assert len(result.entities_created) == len(result.sources_created) == 1
+    source = result.sources_created[0]
+    assert source.primary_or_secondary is SourceOrigin.PRIMARY
+    assert source.independence_group == material["independence_group"]
+    assert len(result.evidence_created) == 3 and len(result.variables_created) == 2
+    assert [item.source_locator for item in result.evidence_created] == ["B001", "B003", "B005"]
+    assert all(item.source_id == source.source_id for item in result.evidence_created)
+    assert all(item.entity_ids == [result.entities_created[0].entity_id] for item in result.evidence_created)
+    observations = {item.value: item for item in workspace_storage.list_objects(Variable)}
+    assert observations[60].evidence_ids == [result.evidence_created[0].evidence_id, result.evidence_created[2].evidence_id]
+    assert observations[65].evidence_ids == [result.evidence_created[1].evidence_id]
+    for variable in observations.values():
+        assert all(workspace_storage.get_by_id(Evidence, evidence_id).value == variable.value
+                   for evidence_id in variable.evidence_ids)
+    assert result.variables_created == workspace_storage.list_objects(Variable)
+    assert all("chunk" in item.result.casefold() for item in result.not_found)
+    for kind in (Claim, Gap, Estimate, Event):
+        assert workspace_storage.list_objects(kind) == []
+
+    monkeypatch.setattr(backend, "extract", extract)
+    before = {path.name: path.read_bytes() for path in workspace_storage.data_dir.iterdir()}
+    rerun = agent.run(task)
+    assert len(backend.calls) == 6
+    assert not rerun.entities_created and not rerun.sources_created
+    assert not rerun.evidence_created and not rerun.variables_created
+    assert rerun.sources_reused == [source.source_id]
+    assert {path.name: path.read_bytes() for path in workspace_storage.data_dir.iterdir()} == before
+
+
+def test_stage1_later_chunk_failure_retains_two_completed_chunks(
+    task, workspace_storage, source_store, tmp_path, materials, backend_result,
+):
+    material, _, outcomes = long_source_and_chunk_results(task, materials, backend_result, values=(60, 60, 60))
+    failure = ExtractionValidationError("simulated third chunk failure")
+    outcomes[(material["source_ref"], "B005")] = failure
+    backend = FakeExtractionBackend(backend_result, outcomes)
+    agent = ResearchAgent(
+        fixture_tool(tmp_path, [material]), workspace_storage, PROMPT,
+        extraction_backend=backend, source_store=source_store,
+    )
+    with pytest.raises(ResearchAgentError, match="C005") as error:
+        agent.run(task)
+    assert error.value.__cause__ is failure
+    assert len(backend.calls) == 3
+    reopened = ResearchStorage(workspace_storage.data_dir)
+    assert len(reopened.list_objects(Entity)) == len(reopened.list_objects(Source)) == 1
+    evidence = reopened.list_objects(Evidence)
+    assert [item.source_locator for item in evidence] == ["B001", "B003"]
+    variables = reopened.list_objects(Variable)
+    assert len(variables) == 1
+    assert variables[0].evidence_ids == [item.evidence_id for item in evidence]
+    assert source_store.contains(material["source_ref"])
+    for kind in (Claim, Gap, Estimate, Event):
+        assert reopened.list_objects(kind) == []
+
+
+def test_stage1_locator_valid_elsewhere_in_source_is_rejected_for_current_chunk(
+    task, workspace_storage, tmp_path, materials, backend_result,
+):
+    material, _, outcomes = long_source_and_chunk_results(task, materials, backend_result)
+    outcomes[(material["source_ref"], "B003")].evidence[0].source_locator = "B001"
+    backend = FakeExtractionBackend(backend_result, outcomes)
+    agent = ResearchAgent(fixture_tool(tmp_path, [material]), workspace_storage, PROMPT, extraction_backend=backend)
+    with pytest.raises(ResearchAgentError, match="source_locator"):
+        agent.run(task)
+    assert len(backend.calls) == 2
+    assert len(workspace_storage.list_objects(Evidence)) == len(workspace_storage.list_objects(Variable)) == 1
+    assert workspace_storage.list_objects(Evidence)[0].source_locator == "B001"
+
+
+def test_stage1_no_matching_chunks_snapshots_source_without_extraction(
+    task, workspace_storage, source_store, tmp_path, materials, backend_result,
+):
+    material = deepcopy(materials[0])
+    material["content"] = "Unrelated archival observations. " * 330
+    material["tags"] = [agent_module._build_query(task)]
+    backend = FakeExtractionBackend(backend_result)
+    agent = ResearchAgent(
+        fixture_tool(tmp_path, [material]), workspace_storage, PROMPT,
+        extraction_backend=backend, source_store=source_store,
+    )
+    result = agent.run(task)
+    assert backend.calls == []
+    assert source_store.contains(material["source_ref"])
+    assert len(result.sources_created) == 1
+    source = result.sources_created[0]
+    assert source.locator == material["locator"] and source.title == material["title"]
+    assert source.source_type == material["source_type"]
+    assert workspace_storage.list_objects(Source) == [source]
+    assert source.primary_or_secondary is SourceOrigin.PRIMARY
+    assert result.search_coverage.primary_source_found
+    assert not result.entities_created and workspace_storage.list_objects(Entity) == []
+    assert not result.evidence_created and not result.variables_created
+    assert not result.search_coverage.period_covered and not result.search_coverage.scope_covered
+    assert workspace_storage.list_objects(Evidence) == workspace_storage.list_objects(Variable) == []
 
 
 def test_cli_runs_example_with_temporary_data_directory(tmp_path):

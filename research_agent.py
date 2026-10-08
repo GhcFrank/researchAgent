@@ -1,8 +1,9 @@
-"""Research Agent with deterministic mock extraction or an injected backend."""
+"""Research Agent with offline mock extraction or incremental chunk extraction."""
 
 import argparse
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 import re
 import sys
@@ -17,7 +18,6 @@ from llm_extractor import (
     ExtractionError,
     ExtractionResult,
     VariableCandidate,
-    build_locatable_content,
 )
 from research_tools import MockResearchTool, ResearchMaterial, ResearchTool, ResearchToolError
 from run_source_store import RunSourceStore, RunSourceStoreError
@@ -38,6 +38,8 @@ from schemas import (
     VariableInputType,
 )
 from storage import ObjectNotFoundError, ResearchStorage, StorageError
+from source_retrieval import SourceRetrievalError, retrieve_candidate_chunks
+from source_segmentation import SourceBlock, SourceSegmentationError, build_source_blocks, chunk_source_blocks
 
 
 class ResearchAgentError(Exception):
@@ -49,6 +51,7 @@ class AgentPermissionError(ResearchAgentError):
 
 
 _PROJECT_DIR = Path(__file__).resolve().parent
+_LOGGER = logging.getLogger(__name__)
 _ALLOWED_OBJECTS = {Entity, Source, Evidence, Variable}
 _ALLOWED_INPUTS = {
     VariableInputType.OBSERVED,
@@ -113,7 +116,7 @@ def _period(text: str) -> str | None:
 
 
 def _build_query(task: ResearchTask) -> str:
-    # A fixture-specific keyword strategy, not natural-language understanding.
+    # Bounded lexical keywords, not query planning or general translation.
     context = "\n".join(filter(None, [
         task.research_question,
         task.target_requirement.question,
@@ -130,6 +133,24 @@ def _build_query(task: ResearchTask) -> str:
     if "收入" in context:
         keywords.append("revenue")
     return " ".join(dict.fromkeys(keywords))
+
+
+def _retrieval_concepts(task: ResearchTask) -> tuple[list[str], list[str]]:
+    """Reuse task keywords and its literal business scope; no provider planning."""
+    phrases = [task.scope.product_or_business] if task.scope.product_or_business else []
+    return phrases, _build_query(task).split()
+
+
+def _validated_task(task: ResearchTask) -> ResearchTask:
+    if type(task) is not ResearchTask:
+        raise ResearchAgentError("run requires a ResearchTask")
+    try:
+        task = ResearchTask.model_validate(task.model_dump(warnings=False))
+    except ValidationError as exc:
+        raise ResearchAgentError(f"Invalid ResearchTask: {exc}") from exc
+    if task.constraints.max_search_scope is not None:
+        raise ResearchAgentError("v0.1 cannot interpret max_search_scope; use explicit scope and excluded_sources")
+    return task
 
 
 def _requested_metrics(task: ResearchTask) -> set[str]:
@@ -165,16 +186,23 @@ def _extract_source(material: ResearchMaterial, timestamp: str) -> Source:
         independence_group = _stable_id("ORIGIN", "Planet Labs", period, "earnings disclosure")
     else:
         independence_group = _stable_id("ORIGIN", material["locator"])
+    origin = material.get("primary_or_secondary")
+    try:
+        primary_or_secondary = SourceOrigin(origin) if origin is not None else (
+            SourceOrigin.PRIMARY if source_type in _PRIMARY_TYPES else SourceOrigin.SECONDARY
+        )
+    except ValueError as exc:
+        raise ResearchAgentError(f"Invalid source primary_or_secondary: {origin!r}") from exc
     return Source(
         source_id=_stable_id("SOURCE", material["locator"]),
         title=material["title"],
-        publisher=material["publisher"],
+        publisher=material.get("publisher"),
         source_type=material["source_type"],
-        published_date=material["published_date"],
+        published_date=material.get("published_date"),
         accessed_date=timestamp[:10],
         locator=material["locator"],
-        primary_or_secondary=SourceOrigin.PRIMARY if source_type in _PRIMARY_TYPES else SourceOrigin.SECONDARY,
-        independence_group=independence_group,
+        primary_or_secondary=primary_or_secondary,
+        independence_group=material.get("independence_group", independence_group),
     )
 
 
@@ -336,7 +364,7 @@ def _potential_conflicts(evidence: list[Evidence]) -> list[PotentialConflict]:
     ]
 
 
-def _validate_backend_result(result, material: ResearchMaterial) -> ExtractionResult:
+def _validate_backend_result(result, source_blocks: tuple[SourceBlock, ...]) -> ExtractionResult:
     if type(result) is not ExtractionResult:
         raise ResearchAgentError("Extraction backend must return an ExtractionResult")
     for candidates, candidate_type in (
@@ -356,7 +384,7 @@ def _validate_backend_result(result, material: ResearchMaterial) -> ExtractionRe
         result = ExtractionResult.model_validate(result.model_dump(warnings=False))
     except ValidationError as exc:
         raise ResearchAgentError(f"Invalid backend ExtractionResult: {exc}") from exc
-    block_ids = set(build_locatable_content(material["content"]))
+    block_ids = {block.block_id for block in source_blocks}
     for candidate in result.evidence:
         if candidate.source_locator not in block_ids:
             raise ResearchAgentError(f"Invalid backend source_locator: {candidate.source_locator!r}")
@@ -379,11 +407,24 @@ class ResearchAgent:
         *,
         extraction_backend: ExtractionBackend | None = None,
         source_store: RunSourceStore | None = None,
+        search_query: str | None = None,
+        source_refs: list[str] | None = None,
     ):
         self.tool = tool
         self.storage = storage
         self.extraction_backend = extraction_backend
         self.source_store = source_store
+        if search_query is not None and (not isinstance(search_query, str) or not search_query.strip()):
+            raise ResearchAgentError("search_query must be a non-blank string")
+        if source_refs is not None and (
+            not isinstance(source_refs, list)
+            or any(not isinstance(ref, str) or not ref.strip() for ref in source_refs)
+        ):
+            raise ResearchAgentError("source_refs must be a list of non-blank references")
+        # Retrieval tools define their own query syntax (e.g. SEC accepts tickers).
+        # These explicit acquisition bounds do not modify the ResearchTask.
+        self.search_query = search_query
+        self.source_refs = None if source_refs is None else tuple(dict.fromkeys(source_refs))
         try:
             self.prompt = Path(prompt_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -458,59 +499,50 @@ class ResearchAgent:
             _validate_batch(list(updated.values()), Variable),
         )
 
-    def _run_backend(self, task, materials, attempts, timestamp) -> ResearchResult:
-        extractions = []
-        for material in materials:
-            try:
-                extracted = self.extraction_backend.extract(
-                    task=task, material=material, operating_rules=self.prompt,
-                )
-            except ExtractionError as exc:
-                raise ResearchAgentError(f"Extraction backend failed for {material['source_ref']}: {exc}") from exc
-            extractions.append(_validate_backend_result(extracted, material))
-
-        # All extractions have succeeded before conversion or persistence starts.
-        sources_created, sources_reused, sources = self._prepare_sources(materials, timestamp)
-        existing_entities = {item.canonical_name.strip().casefold(): item for item in self.storage.list_objects(Entity)}
-        entities_created, entity_maps = [], []
-        for extracted in extractions:
-            entity_map = {}
-            for candidate in extracted.entities:
-                key = candidate.canonical_name.strip().casefold()
-                entity = existing_entities.get(key)
-                if entity is None:
-                    entity = Entity(entity_id=_stable_id("ENTITY", key), **candidate.model_dump())
-                    entities_created.append(entity)
-                    existing_entities[key] = entity
-                entity_map[key] = entity.entity_id
-            entity_maps.append(entity_map)
+    def _persist_extraction_result(self, extracted, material, timestamp):
+        """Validate one chunk's plan, resolve local indexes, then persist it."""
+        sources_created, sources_reused, sources = self._prepare_sources([material], timestamp)
+        source = sources[0]
+        existing_entities = {
+            item.canonical_name.strip().casefold(): item
+            for item in self.storage.list_objects(Entity)
+        }
+        entities_created = []
+        entity_map = {key: item.entity_id for key, item in existing_entities.items()}
+        for candidate in extracted.entities:
+            key = candidate.canonical_name.strip().casefold()
+            entity = existing_entities.get(key)
+            if entity is None:
+                entity = Entity(entity_id=_stable_id("ENTITY", key), **candidate.model_dump())
+                entities_created.append(entity)
+                existing_entities[key] = entity
+            entity_map[key] = entity.entity_id
 
         evidence, variables = [], []
-        for extracted, source, entity_map in zip(extractions, sources, entity_maps):
-            evidence_index_to_id = {}
-            for index, candidate in enumerate(extracted.evidence):
-                fields = candidate.model_dump(exclude={"entity_names"})
-                fields["entity_ids"] = [_resolve_entity_name(name, entity_map) for name in candidate.entity_names]
-                item = Evidence(
-                    evidence_id=_stable_id("EVIDENCE", source.source_id, fields),
-                    source_id=source.source_id, collected_at=timestamp, **fields,
-                )
-                evidence.append(item)
-                evidence_index_to_id[index] = item.evidence_id
-            for candidate in extracted.variables:
-                try:
-                    evidence_ids = [evidence_index_to_id[index] for index in candidate.evidence_indexes]
-                except KeyError as exc:
-                    raise ResearchAgentError(f"Unresolved candidate evidence index: {exc.args[0]}") from exc
-                fields = candidate.model_dump(exclude={"entity_name", "evidence_indexes", "input_type"})
-                fields.update(
-                    entity_id=_resolve_entity_name(candidate.entity_name, entity_map) if candidate.entity_name is not None else None,
-                    evidence_ids=evidence_ids,
-                    input_type=VariableInputType(candidate.input_type.value),
-                )
-                variables.append(Variable(
-                    variable_id=_stable_id("VARIABLE", fields), last_updated=timestamp, **fields,
-                ))
+        evidence_index_to_id = {}
+        for index, candidate in enumerate(extracted.evidence):
+            fields = candidate.model_dump(exclude={"entity_names"})
+            fields["entity_ids"] = [_resolve_entity_name(name, entity_map) for name in candidate.entity_names]
+            item = Evidence(
+                evidence_id=_stable_id("EVIDENCE", source.source_id, fields),
+                source_id=source.source_id, collected_at=timestamp, **fields,
+            )
+            evidence.append(item)
+            evidence_index_to_id[index] = item.evidence_id
+        for candidate in extracted.variables:
+            try:
+                evidence_ids = [evidence_index_to_id[index] for index in candidate.evidence_indexes]
+            except KeyError as exc:
+                raise ResearchAgentError(f"Unresolved candidate evidence index: {exc.args[0]}") from exc
+            fields = candidate.model_dump(exclude={"entity_name", "evidence_indexes", "input_type"})
+            fields.update(
+                entity_id=_resolve_entity_name(candidate.entity_name, entity_map) if candidate.entity_name is not None else None,
+                evidence_ids=evidence_ids,
+                input_type=VariableInputType(candidate.input_type.value),
+            )
+            variables.append(Variable(
+                variable_id=_stable_id("VARIABLE", fields), last_updated=timestamp, **fields,
+            ))
 
         entities_created = _validate_batch(entities_created, Entity)
         sources_created = _validate_batch(sources_created, Source)
@@ -518,77 +550,257 @@ class ResearchAgent:
         variables = _validate_batch(variables, Variable)
         evidence_created = self._new_objects(evidence, Evidence, "evidence_id")
         variables_created, variables_updated = self._consolidate_variables(variables)
-
-        entities_by_id = {item.entity_id: item for item in existing_entities.values()}
-        requested_entity = task.scope.entity.strip().casefold()
-        requested_business = task.scope.product_or_business
-        requested_geography = task.scope.geography
-        scope_covered = False
-        for item in evidence:
-            linked_entities = [entities_by_id[entity_id] for entity_id in item.entity_ids]
-            entity_covered = not requested_entity or any(
-                requested_entity in {name.strip().casefold() for name in [entity.canonical_name, *entity.aliases]}
-                for entity in linked_entities
-            )
-            business_covered = requested_business is None or (
-                item.scope is not None and item.scope.strip().casefold() == requested_business.strip().casefold()
-            )
-            geography_covered = requested_geography is None or any(
-                entity.geography is not None and entity.geography.strip().casefold() == requested_geography.strip().casefold()
-                for entity in linked_entities
-            )
-            scope_covered |= entity_covered and business_covered and geography_covered
-        not_found = [item.model_copy(update={"search_attempted": list(attempts)})
-                     for extracted in extractions for item in extracted.not_found]
-        candidate_gaps = [item for extracted in extractions for item in extracted.candidate_gaps]
-        if not materials:
-            not_found.append(NotFoundItem(
-                item=task.target_requirement.question, search_attempted=attempts,
-                result="No qualifying source material found",
-            ))
-            candidate_gaps.append(CandidateGap(question=task.target_requirement.question))
-        result = ResearchResult(
-            task_id=task.task_id,
-            entities_created=entities_created,
-            sources_created=sources_created,
-            sources_reused=sources_reused,
-            evidence_created=evidence_created,
-            variables_created=variables_created,
-            search_coverage=SearchCoverage(
-                source_types_checked=list(dict.fromkeys(item["source_type"] for item in materials)),
-                primary_source_found=any(item.primary_or_secondary is SourceOrigin.PRIMARY for item in sources),
-                period_covered=any(task.scope.period is None or (
-                    item.period is not None and item.period.strip().casefold() == task.scope.period.strip().casefold()
-                ) for item in evidence),
-                scope_covered=scope_covered,
-            ),
-            potential_conflicts=[item for extracted in extractions for item in extracted.potential_conflicts],
-            not_found=not_found,
-            candidate_gaps=candidate_gaps,
-            follow_up_candidates=[item for extracted in extractions for item in extracted.follow_up_candidates],
-            research_notes="\n\n".join(extracted.research_notes for extracted in extractions if extracted.research_notes) or None,
-        )
         for batch in (entities_created, sources_created, evidence_created, variables_created):
             for obj in batch:
                 self.storage.insert(obj)
         for obj in variables_updated:
             self.storage.update(obj)
-        return result
+        return entities_created, sources_created, sources_reused, evidence_created, variables_created, evidence
 
-    def run(self, task: ResearchTask) -> ResearchResult:
-        if type(task) is not ResearchTask:
-            raise ResearchAgentError("run requires a ResearchTask")
-        try:
-            task = ResearchTask.model_validate(task.model_dump(warnings=False))
-        except ValidationError as exc:
-            raise ResearchAgentError(f"Invalid ResearchTask: {exc}") from exc
-        if task.constraints.max_search_scope is not None:
-            raise ResearchAgentError("v0.1 cannot interpret max_search_scope; use explicit scope and excluded_sources")
+    def _run_backend(self, task, materials, attempts, timestamp, *, retrieval_terms=None) -> ResearchResult:
+        result = ResearchResult(
+            task_id=task.task_id,
+            search_coverage=SearchCoverage(
+                source_types_checked=list(dict.fromkeys(item["source_type"] for item in materials)),
+                primary_source_found=False, period_covered=False, scope_covered=False,
+            ),
+        )
+        phrases, terms = _retrieval_concepts(task)
+        if retrieval_terms is not None:
+            terms = list(dict.fromkeys([*terms, *retrieval_terms]))
+        diagnostic_keys = {name: set() for name in ("potential_conflicts", "candidate_gaps", "follow_up_candidates")}
+        not_found_by_key, notes = {}, []
+        selected_count = 0
+        for material in materials:
+            try:
+                blocks = build_source_blocks(material["content"])
+                chunks = chunk_source_blocks(blocks)
+                candidates = retrieve_candidate_chunks(
+                    chunks, phrases=phrases, terms=terms, top_k=8, neighbor_radius=0,
+                )
+            except (SourceSegmentationError, SourceRetrievalError) as exc:
+                raise ResearchAgentError(f"Source retrieval failed for {material['source_ref']}: {exc}") from exc
+            if not candidates:
+                # A read Source remains an acquired source even when no chunk matches.
+                created, reused, sources = self._prepare_sources([material], timestamp)
+                for source in created:
+                    self.storage.insert(source)
+                result.sources_created.extend(created)
+                created_source_ids = {source.source_id for source in result.sources_created}
+                for source_id in reused:
+                    if source_id not in created_source_ids and source_id not in result.sources_reused:
+                        result.sources_reused.append(source_id)
+                result.search_coverage.primary_source_found |= any(
+                    source.primary_or_secondary is SourceOrigin.PRIMARY for source in sources
+                )
+            by_id = {chunk.chunk_id: chunk for chunk in chunks}
+            # The existing retriever returns source order, including lexical ranks.
+            for candidate in candidates:
+                chunk = by_id[candidate.chunk_id]
+                selected_count += 1
+                context = f"{material['source_ref']}#{chunk.chunk_id}"
+                _LOGGER.info("Extracting %s (%d blocks, %d chars)", context, len(chunk.blocks), chunk.char_count)
+                try:
+                    extracted = self.extraction_backend.extract(
+                        task=task, material=material, operating_rules=self.prompt,
+                        source_blocks=chunk.blocks,
+                    )
+                except ExtractionError as exc:
+                    _LOGGER.error("Extraction backend failed for %s: %s", context, type(exc).__name__)
+                    raise ResearchAgentError(f"Extraction backend failed for {context}: {exc}") from exc
+                try:
+                    extracted = _validate_backend_result(extracted, chunk.blocks)
+                    batches = self._persist_extraction_result(extracted, material, timestamp)
+                except (ResearchAgentError, StorageError, ValidationError) as exc:
+                    _LOGGER.error("Chunk validation/persistence failed for %s: %s", context, type(exc).__name__)
+                    exc.add_note(f"Source/chunk: {context}; earlier successful chunks remain persisted.")
+                    raise
+                entities_created, sources_created, sources_reused, evidence_created, variables_created, evidence = batches
+                result.entities_created.extend(entities_created)
+                result.sources_created.extend(sources_created)
+                created_source_ids = {source.source_id for source in result.sources_created}
+                for source_id in sources_reused:
+                    if source_id not in created_source_ids and source_id not in result.sources_reused:
+                        result.sources_reused.append(source_id)
+                result.evidence_created.extend(evidence_created)
+                result.variables_created.extend(variables_created)
+                source_ids = [source.source_id for source in sources_created] + sources_reused
+                result.search_coverage.primary_source_found |= any(
+                    self.storage.get_by_id(Source, source_id).primary_or_secondary is SourceOrigin.PRIMARY
+                    for source_id in source_ids
+                )
+                for item in evidence:
+                    linked_entities = [self.storage.get_by_id(Entity, entity_id) for entity_id in item.entity_ids]
+                    entity_covered = not task.scope.entity.strip() or any(
+                        task.scope.entity.strip().casefold() in {
+                            name.strip().casefold() for name in [entity.canonical_name, *entity.aliases]
+                        } for entity in linked_entities
+                    )
+                    business_covered = task.scope.product_or_business is None or (
+                        item.scope is not None and item.scope.strip().casefold() == task.scope.product_or_business.strip().casefold()
+                    )
+                    geography_covered = task.scope.geography is None or any(
+                        entity.geography is not None and entity.geography.strip().casefold() == task.scope.geography.strip().casefold()
+                        for entity in linked_entities
+                    )
+                    result.search_coverage.scope_covered |= entity_covered and business_covered and geography_covered
+                    result.search_coverage.period_covered |= task.scope.period is None or (
+                        item.period is not None and item.period.strip().casefold() == task.scope.period.strip().casefold()
+                    )
+                for name in diagnostic_keys:
+                    for item in getattr(extracted, name):
+                        key = item.model_dump_json()
+                        if key not in diagnostic_keys[name]:
+                            diagnostic_keys[name].add(key)
+                            getattr(result, name).append(item)
+                for item in extracted.not_found:
+                    # Absence describes only this supplied chunk, never the Source/run.
+                    key = (item.item, item.result)
+                    search_attempted = list(dict.fromkeys([*attempts, context]))
+                    if key in not_found_by_key:
+                        saved = not_found_by_key[key]
+                        saved.search_attempted = list(dict.fromkeys([*saved.search_attempted, *search_attempted]))
+                    else:
+                        saved = item.model_copy(update={
+                            "search_attempted": search_attempted,
+                            "result": "Chunk-local diagnostic only; not a Source/run absence: " + item.result,
+                        })
+                        not_found_by_key[key] = saved
+                        result.not_found.append(saved)
+                if extracted.research_notes and extracted.research_notes not in notes:
+                    notes.append(extracted.research_notes)
+        if not materials:
+            result.not_found.append(NotFoundItem(
+                item=task.target_requirement.question, search_attempted=attempts,
+                result="No qualifying source material found",
+            ))
+            result.candidate_gaps.append(CandidateGap(question=task.target_requirement.question))
+        elif not selected_count:
+            result.not_found.append(NotFoundItem(
+                item=task.target_requirement.question, search_attempted=attempts,
+                result="No lexical candidate chunks selected; requirement coverage has not been established.",
+            ))
+        # Later chunks may extend a newly created Variable's evidence lineage.
+        result.variables_created = [self.storage.get_by_id(Variable, item.variable_id) for item in result.variables_created]
+        result.research_notes = "\n\n".join([
+            "Incremental per-chunk extraction. Missing-information diagnostics refer only to supplied chunks; they do not establish Source/run absence.",
+            *notes,
+        ])
+        return ResearchResult.model_validate(result.model_dump())
+
+    def _snapshot_material(self, material, source_ref):
+        if self.source_store is not None:
+            try:
+                self.source_store.put(material)
+            except RunSourceStoreError as exc:
+                raise ResearchAgentError(f"Source material persistence failed for {source_ref}: {exc}") from exc
+
+    def run_known_sources(
+        self,
+        task: ResearchTask,
+        source_refs: list[str],
+        *,
+        candidate_metadata: list[dict],
+        retrieval_terms: list[str] | None = None,
+    ) -> ResearchResult:
+        """Read selected references directly and reuse incremental Stage 1 processing.
+
+        Snapshotted or persisted sources are skipped; this is not a partial-run
+        resume mechanism. Candidate metadata binds each ref to its exact locator.
+        No search, routing, selection or coverage evaluation is performed.
+        """
+        task = _validated_task(task)
+        if self.source_store is None or self.extraction_backend is None:
+            raise ResearchAgentError("Known-source acquisition requires a source_store and extraction_backend")
+        if not isinstance(source_refs, list) or any(not isinstance(ref, str) or not ref.strip() for ref in source_refs):
+            raise ResearchAgentError("source_refs must be a list of non-blank references")
+        if not isinstance(candidate_metadata, list):
+            raise ResearchAgentError("candidate_metadata must be a list of source metadata")
+        metadata_by_ref = {}
+        for item in candidate_metadata:
+            if not isinstance(item, dict) or any(
+                not isinstance(item.get(field), str) or not item[field].strip()
+                for field in ("source_ref", "locator")
+            ):
+                raise ResearchAgentError("Candidate metadata requires non-blank source_ref and locator")
+            if item["source_ref"] in metadata_by_ref:
+                raise ResearchAgentError("Duplicate source_ref in candidate_metadata")
+            metadata_by_ref[item["source_ref"]] = item
+        refs = list(dict.fromkeys(source_refs))
+        if any(ref not in metadata_by_ref for ref in refs):
+            raise ResearchAgentError("Selected source_ref is absent from candidate_metadata")
+        excluded = {item.casefold() for item in task.constraints.excluded_sources}
+        if any(
+            str(value).casefold() in excluded
+            for ref in refs for value in metadata_by_ref[ref].values()
+        ):
+            raise ResearchAgentError("Selected source is excluded by ResearchTask constraints")
+        if retrieval_terms is not None and (
+            not isinstance(retrieval_terms, list)
+            or any(not isinstance(term, str) or not term.strip() for term in retrieval_terms)
+        ):
+            raise ResearchAgentError("retrieval_terms must be a list of non-blank strings")
 
         timestamp = datetime.now(timezone.utc).isoformat()
-        query = _build_query(task)
+        existing_by_locator = {source.locator: source for source in self.storage.list_objects(Source)}
+        acquired_locators = set(existing_by_locator)
+        materials, skipped, reused = [], [], []
+        for ref in refs:
+            locator = metadata_by_ref[ref]["locator"]
+            try:
+                cached = self.source_store.get(ref)
+            except RunSourceStoreError as exc:
+                raise ResearchAgentError(f"Cannot inspect source snapshot for {ref}: {exc}") from exc
+            if cached is not None and cached.get("locator") != locator:
+                raise ResearchAgentError(f"Source snapshot locator does not match selected metadata for {ref}")
+            existing = existing_by_locator.get(locator)
+            if cached is not None or locator in acquired_locators:
+                acquired_locators.add(locator)
+                skipped.append(ref)
+                if existing is not None and existing not in reused:
+                    reused.append(existing)
+                continue
+            material = self.tool.read(ref)
+            if not isinstance(material, dict) or material.get("source_ref") != ref or material.get("locator") != locator:
+                raise ResearchAgentError(f"Read material source_ref/locator does not match selected metadata for {ref}")
+            self._snapshot_material(material, ref)
+            acquired_locators.add(locator)
+            materials.append(material)
+
+        # Metadata-only dedup must never attach new block IDs to another filing.
+        # Validate pending sources together, including collisions within this batch.
+        _, _, sources = self._prepare_sources(materials, timestamp)
+        if any(source.locator != material["locator"] for source, material in zip(sources, materials)):
+            raise ResearchAgentError("Source deduplication would reuse a different locator; selected-source provenance is ambiguous")
+        result = self._run_backend(task, materials, [], timestamp, retrieval_terms=retrieval_terms) if materials else ResearchResult(
+            task_id=task.task_id,
+            search_coverage=SearchCoverage(
+                source_types_checked=[], primary_source_found=False, period_covered=False, scope_covered=False,
+            ),
+        )
+        for source in reused:
+            if source.source_id not in result.sources_reused:
+                result.sources_reused.append(source.source_id)
+            if source.source_type not in result.search_coverage.source_types_checked:
+                result.search_coverage.source_types_checked.append(source.source_type)
+            result.search_coverage.primary_source_found |= source.primary_or_secondary is SourceOrigin.PRIMARY
+        if skipped:
+            result.research_notes = "\n\n".join(filter(None, [
+                result.research_notes,
+                "Skipped already acquired selected sources without download or extraction: " + ", ".join(skipped)
+                + ". Partial-run resume and requirement coverage evaluation were not performed.",
+            ]))
+        return ResearchResult.model_validate(result.model_dump())
+
+    def run(self, task: ResearchTask) -> ResearchResult:
+        task = _validated_task(task)
+
+        timestamp = datetime.now(timezone.utc).isoformat()
+        query = self.search_query if self.search_query is not None else _build_query(task)
         attempts = [query] if query else []
         summaries = self.tool.search(query) if query else []
+        if self.source_refs is not None:
+            summaries = [item for item in summaries if item["source_ref"] in self.source_refs]
         excluded = {item.casefold() for item in task.constraints.excluded_sources}
         summaries = [item for item in summaries if not any(str(value).casefold() in excluded for value in item.values())]
         preferences = [item.casefold() for item in task.preferred_source_types]
@@ -599,11 +811,7 @@ class ResearchAgent:
         materials = []
         for ref in dict.fromkeys(item["source_ref"] for item in summaries):
             material = self.tool.read(ref)
-            if self.source_store is not None:
-                try:
-                    self.source_store.put(material)
-                except RunSourceStoreError as exc:
-                    raise ResearchAgentError(f"Source material persistence failed for {ref}: {exc}") from exc
+            self._snapshot_material(material, ref)
             materials.append(material)
 
         if self.extraction_backend is not None:
